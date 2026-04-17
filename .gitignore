@@ -1,0 +1,13 @@
+research/
+release/
+original.prx
+fatms*.log
+
+# PSP build artifacts
+*.o
+*.elf
+*.prx
+EBOOT.PBP
+PARAM.SFO
+DratiniFS.zip
+DratiniFS/
