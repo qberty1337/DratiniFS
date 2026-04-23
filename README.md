@@ -17,6 +17,6 @@ FAT16 / 12 support is also missing so sdcards smaller than 4 GB (if they aren't 
 
 aside from the race conditions and DATAINSTALL issues for some games (works in LBP but not MGS:PW??), there's another issue that cannot be fixed in software automatically, and that is the total disk size. Most adapters i've seen report 57 GB total, some less or more than others but it's never the correct size (in an attempt to fool the controller) so i've bundled an MSSTOR patcher that maxes out the total usable space to 2 TB (theoretical max of the hardware). This solves letting you use any size sdcard without msstor tripping the validation, but most importantly both DratiniFS and Leftovers will patch it in mem after it can read all available partitions to give it a real value of accessible data. My issue with this, is that it's not "real" (if you have 1 TB with a 400 GB partition on it the driver will patch in 400 GB). We can't patch in the actual disk size because the adapter never reports it. So connecting the PSP to your PC will always show only visible partitions and not the whole disk. The only solution to this is rewrite MSSTOR completely to handle this (which is outside of my wheelhosue) or have a homebrew app scan the disk for it's "real" size and store it per sdcard.... :/
 
-i'll update this repo with proper docs of my findings plus better commenting when I have some time.
+i'll update this repo with proper docs of my findings plus better commenting when I have some time. 
 
-no license as this is a hobby project do whatever you'd like with it, though do let me know (if I could also improve something as well).
+adding MIT license for now until I can dedicate some more time to polishing this up.

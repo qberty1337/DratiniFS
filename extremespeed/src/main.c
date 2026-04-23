@@ -2509,14 +2509,6 @@ static void format_memstick(void)
 
 // flash0 install/uninstall helpers
 
-static void open_flash(void)
-{
-    while (sceIoUnassign("flash0:") < 0)
-        sceKernelDelayThread(500000);
-    while (sceIoAssign("flash0:", "lflash0:0,0", "flashfat0:", 0, NULL, 0) < 0)
-        sceKernelDelayThread(500000);
-}
-
 // copy file from src to dst, returns bytes written or -1 on error
 static int copy_file(const char *src_path, const char *dst_path)
 {
@@ -2547,6 +2539,40 @@ static int eboot_dir_len(void)
     int len = 0, last_slash = -1;
     while (eboot_path[len]) { if (eboot_path[len] == '/') last_slash = len; len++; }
     return (last_slash >= 0) ? last_slash + 1 : -1;
+}
+
+// use a hybrid vsh/kernel flash0 writer (same style of seen used in other flash0 installers)
+
+typedef struct {
+    char src[128];
+    char dst[128];
+} kflash_args_t;
+
+static int kflash_install(const char *src, const char *dst)
+{
+    int dlen = eboot_dir_len();
+    if (dlen < 0) return -1;
+
+    char prx_path[512];
+    memcpy(prx_path, eboot_path, dlen);
+    memcpy(prx_path + dlen, "kernel_flash.prx", 17);
+
+    kflash_args_t args;
+    memset(&args, 0, sizeof(args));
+    strncpy(args.src, src, sizeof(args.src) - 1);
+    strncpy(args.dst, dst, sizeof(args.dst) - 1);
+
+    SceUID mod = sceKernelLoadModule(prx_path, 0, NULL);
+    if (mod < 0) return mod;
+
+    int status = 0;
+    sceKernelStartModule(mod, sizeof(args), &args, &status, NULL);
+
+    // stop + unload explicitly either way.
+    sceKernelStopModule(mod, 0, NULL, NULL, NULL);
+    sceKernelUnloadModule(mod);
+
+    return status;
 }
 
 static void install_flash0(void)
@@ -2621,24 +2647,25 @@ static void install_flash0(void)
     }
     printf("Backup saved (%d bytes).\n", backup_bytes);
 
-    printf("Opening flash0 for writing...\n");
-    open_flash();
+    printf("Invoking kernel writer for flash0...\n");
 
-    // copy dratinifs.prx to flash0
-    int total = copy_file(prx_path, "flash0:/kd/fatms.prx");
+    int rc = kflash_install(prx_path, "flash0:/kd/fatms.prx");
 
-    if (total == (int)file_size) {
+    if (rc == 0) {
         flash_state = 2;
         backup_found = 1;
         pspDebugScreenSetTextColor(0xFF00FF00);
-        printf("\nDratiniFS installed to flash0:/kd/fatms.prx (%d bytes).\n", total);
+        printf("\nDratiniFS installed to flash0:/kd/fatms.prx (%d bytes).\n",
+               (int)file_size);
         printf("\nPress X to reboot.\n");
         wait_cross();
         scePowerRequestColdReset(0);
     } else {
         pspDebugScreenSetTextColor(0xFF0000FF);
-        printf("Error: wrote %d of %d bytes.\n", total < 0 ? 0 : total, (int)file_size);
-        printf("flash0 may be corrupted! Restore from backup!\n");
+        printf("Error: flash0 write failed: 0x%08X\n", rc);
+        printf("If the error starts with 0x8002, ensure kernel_flash.prx\n");
+        printf("is sitting next to EBOOT.PBP. Otherwise flash0 may be\n");
+        printf("corrupted and should be restored from backup.\n");
         printf("\nPress X to return.\n");
         wait_cross();
     }
@@ -2699,22 +2726,22 @@ static void uninstall_flash0(void)
         sceDisplayWaitVblankStart();
     }
 
-    printf("\nOpening flash0 for writing...\n");
-    open_flash();
+    printf("\nInvoking kernel writer for flash0...\n");
 
-    int total = copy_file(backup_path, "flash0:/kd/fatms.prx");
+    int rc = kflash_install(backup_path, "flash0:/kd/fatms.prx");
 
-    if (total == (int)file_size) {
+    if (rc == 0) {
         flash_state = 0;
         pspDebugScreenSetTextColor(0xFF00FF00);
-        printf("\nOriginal fatms.prx restored (%d bytes).\n", total);
+        printf("\nOriginal fatms.prx restored (%d bytes).\n", (int)file_size);
         printf("\nPress X to reboot.\n");
         wait_cross();
         scePowerRequestColdReset(0);
     } else {
         pspDebugScreenSetTextColor(0xFF0000FF);
-        printf("Error: wrote %d of %d bytes.\n", total < 0 ? 0 : total, (int)file_size);
-        printf("flash0 may be corrupted!\n");
+        printf("Error: flash0 write failed: 0x%08X\n", rc);
+        printf("If the error starts with 0x8002, ensure kernel_flash.prx\n");
+        printf("is sitting next to EBOOT.PBP.\n");
         printf("\nPress X to return.\n");
         wait_cross();
     }
