@@ -13,6 +13,10 @@
 
 extern SceModule *sceKernelFindModuleByName(const char *name);
 
+// cache the flush stubs for binary-patching msstor's sub_03334 in place
+extern void sceKernelDcacheWritebackInvalidateRange(const void *addr, unsigned int size);
+extern void sceKernelIcacheInvalidateAll(void);
+
 // use mutex to match sony's fatms behavior (switch from semaphore during POC)
 // no measurable performance difference (only theoretical)
 SceUID sceKernelCreateMutex(const char *name, unsigned int attr, int initial_count, void *option);
@@ -182,6 +186,7 @@ unsigned long long es_get_blk_fd_pos(void) { return blk_fd_pos; }
 void es_set_blk_fd_pos(unsigned long long pos) { blk_fd_pos = pos; }
 static int g_use_exfat = 0; // 1 = exfat filesystem, 0 = fat32 (should I add fat16 support?)
 static volatile int fs_initialized = 0; // set by deferred_fs_init on first iodevctl
+static volatile unsigned int g_real_total_sectors = 0;
 
 // detect stale blk_fd -- sceiocloseall kills kernel fds during game launch
 static int blk_fd_validated = 0;
@@ -203,7 +208,7 @@ static void reopen_blk_fd_if_needed(void)
         blk_fd_validated = 1;
         blk_fd_pos = 0xFFFFFFFFFFFFFFFFULL;
         // invalidate es position cache (make this conditional!))
-        es_sync_blk_fd();                    
+        es_sync_blk_fd();
     }
 }
 
@@ -215,7 +220,7 @@ static unsigned int fat32_fat_size;
 static unsigned int fat32_data_start_sector;
 static unsigned int fat32_root_cluster;
 static unsigned int fat32_total_sectors;   // this comes from bpb
-static unsigned int fat32_total_clusters; 
+static unsigned int fat32_total_clusters;
 static unsigned int fat32_free_clusters;   // cached free cluster count (IMPORTANT! computed at init!!)
 static unsigned int fat32_next_free_hint = 2;
 static unsigned int exfat_free_clusters;
@@ -307,7 +312,7 @@ static int fatms_sysevent_handler(int ev_id, char *ev_name, void *param, int *re
     // flag signal (sub_0b974). file i/o (k_sceioclose) must not run with
     // interrupts disabled - it can block waiting for hardware dma (bricked a 1k on cold boot because of this haha..)
     switch (ev_id) {
-    case 0x00000102: 
+    case 0x00000102:
         // suspend / usb mode entering
         if (blk_fd >= 0) {
             k_sceIoClose(blk_fd);
@@ -319,7 +324,7 @@ static int fatms_sysevent_handler(int ev_id, char *ev_name, void *param, int *re
         blk_wr_cache_sector[0] = 0xFFFFFFFF;
         blk_wr_cache_sector[1] = 0xFFFFFFFF;
         break;
-    case 0x00010000: 
+    case 0x00010000:
         // resume / usb exit
         blk_fd_validated = 0;
         break;
@@ -1754,7 +1759,7 @@ static int fat32_write_dir_entry_lfn(unsigned int dir_cluster, FatDirEntry *entr
                     unsigned char *lfn = sec_buf + (e + (num_lfn - lfn_idx)) * 32;
                     memset(lfn, 0xFF, 32);
                     lfn[0] = lfn_idx | (lfn_idx == num_lfn ? 0x40 : 0); // seq + last flag
-                    lfn[11] = 0x0F; 
+                    lfn[11] = 0x0F;
                     lfn[12] = 0;
                     lfn[13] = cksum;
                     lfn[26] = 0; lfn[27] = 0;
@@ -1775,7 +1780,7 @@ static int fat32_write_dir_entry_lfn(unsigned int dir_cluster, FatDirEntry *entr
                         } else if (idx == name_len) {
                             positions[ci][0] = 0; positions[ci][1] = 0;
                         } else {
-                            positions[ci][0] = 0xFF; positions[ci][1] = 0xFF; 
+                            positions[ci][0] = 0xFF; positions[ci][1] = 0xFF;
                         }
                     }
                 }
@@ -3609,7 +3614,7 @@ static int exfat_IoRename(PspIoDrvFileArg *arg, const char *oldname, const char 
                           }
                         }
                         // delete old sfn
-                        de->name[0] = 0xE5; 
+                        de->name[0] = 0xE5;
                         blk_write_sectors(sec + s, sec_buf, 1);
                         blk_wr_cache_push(sec + s, sec_buf);
                         // create new entry with lfn in same parent
@@ -3875,7 +3880,7 @@ static int exfat_IoDevctl(PspIoDrvFileArg *arg, const char *devname,
         return 0;
 
     // this is the ms controller status
-    // xmb polls this to detect the card state, use mount_state which isupdated 
+    // xmb polls this to detect the card state, use mount_state which isupdated
     // by sysevent handler on eject (0x00100000) and ioumount
     case 0x02025801:
         if (outdata && outlen >= 4)
@@ -4007,7 +4012,7 @@ static int exfat_IoDevctl(PspIoDrvFileArg *arg, const char *devname,
         // write the mbr at absolute sector 0
         memset(fbuf, 0, 512);
         // partition entry 0 at offset 446 is the fs partition
-        fbuf[446] = 0x80;  
+        fbuf[446] = 0x80;
         fbuf[447] = 0xFE; fbuf[448] = 0xFF; fbuf[449] = 0xFF;
         fbuf[450] = fmt_exfat ? 0x07 : 0x0C;
         fbuf[451] = 0xFE; fbuf[452] = 0xFF; fbuf[453] = 0xFF;
@@ -4373,7 +4378,7 @@ static int exfat_IoDevctl(PspIoDrvFileArg *arg, const char *devname,
         return 0;
 
     // alt get freespace avail (actually just the same as 0x02425818)
-    case 0x0241D819: 
+    case 0x0241D819:
         if (outdata && outlen >= 20) {
             unsigned int *ds = (unsigned int *)outdata;
             if (g_use_exfat) {
@@ -4445,7 +4450,7 @@ static int exfat_IoDevctl(PspIoDrvFileArg *arg, const char *devname,
     }
 
     // set and get attrib / rename through devctl
-    case 0x0242D81A: 
+    case 0x0242D81A:
     case 0x0242D81C:
     case 0x02415830:
         return 0;
@@ -4918,7 +4923,7 @@ static int __attribute__((noinline)) fat32_init(void)
     return 0;
 }
 
-// exFAT vbr parser 
+// exFAT vbr parser
 // fills the same fat32_* globals and exfat fat entries are an identical 32-bit format so all cluster walk logic works unchanged!...mostly lol
 // exfat vbr offsets are [80] fatoffset, [88] clusterheapoffset, [96] rootcluster, [108] bytespersectorshift, [109] sectorsperclustershift
 // exfat_init: reads vbr and populates exfat_* globals only
@@ -5106,8 +5111,23 @@ static void deferred_fs_init(void)
                         unsigned int end = lba + ns;
                         if (end > max_end) max_end = end;
                     }
-                    if (max_end > 0)
+                    if (max_end > 0) {
                         ((volatile unsigned int *)dev_struct)[5016] = max_end;
+                        g_real_total_sectors = max_end;
+
+                        // patch msstor sub_03334 to return g_real_total_sectors
+                        // usbstorms's READ CAPACITY cache fill calls msstor IoIoctl 0x02125006 thank you lusid1 !!! (this fixes USB Connection!)
+                        unsigned int gptr = (unsigned int)&g_real_total_sectors;
+                        unsigned int hi = (gptr + 0x8000) >> 16;
+                        unsigned int lo = gptr & 0xFFFF;
+                        volatile unsigned int *p = (volatile unsigned int *)(text_addr + 0x3334);
+                        p[0] = 0x3C020000 | hi;
+                        p[1] = 0x8C420000 | lo;
+                        p[2] = 0x03E00008;
+                        p[3] = 0x00000000;
+                        sceKernelDcacheWritebackInvalidateRange((const void *)p, 16);
+                        sceKernelIcacheInvalidateAll();
+                    }
                 }
                 blk_fd_pos = 0xFFFFFFFFFFFFFFFFULL;
             }
@@ -5249,6 +5269,13 @@ static int assign_thread(SceSize args, void *argp)
         if (blk_fd >= 0) {
             notify_all_callbacks(1);
         }
+    }
+
+    // patch msstor [5016] now before usbstorms can load
+    if (blk_fd >= 0 && fs_initialized != 2) {
+        if (fs_mutex >= 0) sceKernelLockMutex(fs_mutex, 1, 0);
+        deferred_fs_init();
+        if (fs_mutex >= 0) sceKernelUnlockMutex(fs_mutex, 1);
     }
     // register with mscmhc0 for hardware card events
     // passes pointer to eventflag sceuid as indata, receives reg handle in outdata

@@ -33,6 +33,7 @@ IMPORT_FUNC "InterruptManagerForKernel", 0x5F10D406, sceKernelCpuResumeIntr
 // maintly need dcache and time (reconsider?..)
 IMPORT_START "UtilsForKernel", 0x00090000
 IMPORT_FUNC "UtilsForKernel", 0x34B9FA9E, sceKernelDcacheWritebackInvalidateRange
+IMPORT_FUNC "UtilsForKernel", 0x920F104A, sceKernelIcacheInvalidateAll
 IMPORT_FUNC "UtilsForKernel", 0x27CC57F0, sceKernelLibcTime
 
 IMPORT_START "InitForKernel", 0x00090000

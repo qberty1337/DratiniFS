@@ -1,4 +1,6 @@
 research/
+graphify*/
+.graphify*
 release/
 original.prx
 fatms*.log
