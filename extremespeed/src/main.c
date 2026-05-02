@@ -1,4 +1,4 @@
-// extremespeed manager for managing the raw iso partition. 
+// extremespeed manager for managing the raw iso partition.
 // we'll also comms with dratinifs via sceidevctl for raw sector access... We should be good to manuipulate the whole diskk
 // and escape partition table boundary scope
 
@@ -167,7 +167,7 @@ static int write_mbr_verified(unsigned char *buf)
     return 0;
 }
 
-// write superblock + backup at sector 80 with crc32
+// write superblock + backup at sector 200
 static int write_superblock_with_backup(unsigned int partition_start, unsigned char *sb_buf)
 {
     ExtremeSpeedSuperblock *sb = (ExtremeSpeedSuperblock *)sb_buf;
@@ -177,9 +177,68 @@ static int write_superblock_with_backup(unsigned int partition_start, unsigned c
 
     if (devctl_write_sectors_checked(partition_start, sb_buf, 1) < 0)
         return -1;
-    if (devctl_write_sectors_checked(partition_start + 80, sb_buf, 1) < 0)
+    if (devctl_write_sectors_checked(partition_start + ES_BACKUP_SB_SECTOR, sb_buf, 1) < 0)
         return -1;
     return 0;
+}
+
+// in RAM cache of the name pool
+static unsigned char g_pool[ES_NAME_POOL_BYTES] __attribute__((aligned(64)));
+
+// load the entire name pool from disk
+static int pool_refresh(unsigned int partition_start)
+{
+    int s;
+    for (s = 0; s < ES_NAME_POOL_SECTORS; s++) {
+        if (devctl_read_sectors(partition_start + ES_NAME_POOL_START_SECTOR + s,
+                                g_pool + s * ES_SECTOR_SIZE, 1) < 0)
+            return -1;
+    }
+    g_pool[ES_NAME_POOL_BYTES - 1] = 0;  // safety NUL at the very end
+    return 0;
+}
+
+static const char *pool_get(const ExtremeSpeedEntry *ent)
+{
+    if (!ent || ent->name_len == 0) return "";
+    if (ent->name_off == ES_NAME_INVALID_OFF) return "";
+    if ((unsigned int)ent->name_off + (unsigned int)ent->name_len >= ES_NAME_POOL_BYTES)
+        return "";
+    return (const char *)&g_pool[ent->name_off];
+}
+
+static unsigned int pool_append_name(unsigned int partition_start,
+                                     unsigned int pool_used,
+                                     const char *name,
+                                     int name_len)
+{
+    if (name_len <= 0 || name_len >= ES_NAME_MAX_LEN) return 0xFFFFFFFFu;
+    // need name_len bytes + 1 NUL
+    if ((unsigned int)pool_used + (unsigned int)name_len + 1 > ES_NAME_POOL_BYTES)
+        return 0xFFFFFFFFu;
+
+    unsigned int sec_idx = pool_used / ES_SECTOR_SIZE;
+    unsigned int off_in_sec = pool_used % ES_SECTOR_SIZE;
+    unsigned int abs_sec = partition_start + ES_NAME_POOL_START_SECTOR + sec_idx;
+
+    // spans 2 sectors if (off_in_sec + name_len + 1) > ES_SECTOR_SIZE
+    unsigned char buf[ES_SECTOR_SIZE * 2] __attribute__((aligned(64)));
+    int spans_two = (off_in_sec + (unsigned int)name_len + 1) > ES_SECTOR_SIZE;
+
+    if (devctl_read_sectors(abs_sec, buf, 1) < 0) return 0xFFFFFFFFu;
+    if (spans_two) {
+        if (devctl_read_sectors(abs_sec + 1, buf + ES_SECTOR_SIZE, 1) < 0)
+            return 0xFFFFFFFFu;
+    }
+    memcpy(buf + off_in_sec, name, name_len);
+    buf[off_in_sec + name_len] = '\0';
+
+    if (devctl_write_sectors(abs_sec, buf, 1) < 0) return 0xFFFFFFFFu;
+    if (spans_two) {
+        if (devctl_write_sectors(abs_sec + 1, buf + ES_SECTOR_SIZE, 1) < 0)
+            return 0xFFFFFFFFu;
+    }
+    return pool_used;
 }
 
 
@@ -552,7 +611,7 @@ static void create_partition(void)
         int dr = sceIoDevctl("fatms0:", 0x02425818, &dsp, 4, NULL, 0);
         if (dr >= 0 && ds[0] > 0 && ds[4] > 0) {
             unsigned int used_clusters = ds[0] - ds[1];
-            unsigned int spc = ds[4]; 
+            unsigned int spc = ds[4];
             unsigned int used_sectors = used_clusters * spc;
             unsigned int fs_keep = used_sectors + 204800;
             fs_keep += part_size / 100;
@@ -1152,6 +1211,7 @@ static void list_isos(void)
             return;
         }
     }
+    pool_refresh(info.partition_start_sector);
 
     printf("  # | Game ID         | Size     | Filename\n");
     printf("  --+-----------------+----------+---------\n");
@@ -1165,7 +1225,7 @@ static void list_isos(void)
 
         unsigned int mb = ent->size_lo / (1024 * 1024);
         printf(" %2d | %-15s | %4u MB  | %s\n",
-               shown + 1, ent->game_id, mb, ent->filename);
+               shown + 1, ent->game_id, mb, pool_get(ent));
         shown++;
 
         if (shown % 20 == 0) {
@@ -1442,26 +1502,49 @@ static void transfer_to_es(void)
         return;
     }
 
+    // we gonna build full filename, append to name pool, then writethe entry
+    char fullname[ES_NAME_MAX_LEN];
+    int fullname_len = snprintf(fullname, sizeof(fullname), "ISO/%s", iso_names[sel]);
+    if (fullname_len <= 0 || fullname_len >= ES_NAME_MAX_LEN) {
+        printf("Filename too long (%d chars max).\n", ES_NAME_MAX_LEN - 1);
+        wait_cross(); return;
+    }
+
+    unsigned int pool_used = sb->pool_used_bytes;
+    unsigned int name_off = pool_append_name(info.partition_start_sector,
+                                              pool_used, fullname, fullname_len);
+    if (name_off == 0xFFFFFFFFu) {
+        printf("Name pool full or write failed!\n");
+        wait_cross(); return;
+    }
+
     // build the entry
     ExtremeSpeedEntry entry;
     memset(&entry, 0, sizeof(entry));
-    snprintf(entry.filename, ES_FILENAME_SIZE, "ISO/%.251s", iso_names[sel]);
     memcpy(entry.game_id, game_id, ES_GAME_ID_SIZE);
     entry.start_sector = info.free_sector;
     entry.size_sectors = needed_sectors;
     entry.size_lo = file_size;
-    entry.size_hi = 0;
     entry.flags = ES_FLAG_ACTIVE;
+    entry.name_off = name_off;
+    entry.name_len = (uint16_t)fullname_len;
 
-    // atomic it
-    unsigned int entry_sector = 1 + new_idx;
-    if (devctl_write_sectors_checked(info.partition_start_sector + entry_sector,
-                                      &entry, 1) < 0) {
+    unsigned int ent_byte_off = new_idx * ES_ENTRY_SIZE;
+    unsigned int ent_sec = 1 + (ent_byte_off / 512);
+    unsigned int ent_sec_off = ent_byte_off % 512;
+    unsigned char ent_buf[512] __attribute__((aligned(64)));
+    if (devctl_read_sectors(info.partition_start_sector + ent_sec, ent_buf, 1) < 0) {
+        printf("CRITICAL: Entry sector read failed!\n"); wait_cross(); return;
+    }
+    memcpy(ent_buf + ent_sec_off, &entry, ES_ENTRY_SIZE);
+    if (devctl_write_sectors_checked(info.partition_start_sector + ent_sec,
+                                      ent_buf, 1) < 0) {
         printf("CRITICAL: Entry write failed!\n"); wait_cross(); return;
     }
 
     // write the superblock last (just in case power gets cut or somethin' midwrite)
     sb->iso_count = new_idx + 1;
+    sb->pool_used_bytes = pool_used + fullname_len + 1;  // +1 for NUL
     if (write_superblock_with_backup(info.partition_start_sector, sb_buf) < 0) {
         printf("CRITICAL: Superblock write failed!\n"); wait_cross(); return;
     }
@@ -1530,6 +1613,7 @@ static void transfer_from_es(void)
         devctl_read_sectors(es_info.partition_start_sector + 1 + s,
                              table_buf + s * 512, 1);
     }
+    pool_refresh(es_info.partition_start_sector);
 
     int active_indices[ES_MAX_ISOS];
     int active_count = 0;
@@ -1557,7 +1641,7 @@ static void transfer_from_es(void)
             if (i == sel) pspDebugScreenSetTextColor(0xFF00FF00);
             else pspDebugScreenSetTextColor(0xFFFFFFFF);
             printf("  %s %-40.40s %4lu MB\n",
-                   (i == sel) ? ">" : " ", ent->filename, ent->size_lo / (1024*1024));
+                   (i == sel) ? ">" : " ", pool_get(ent), ent->size_lo / (1024*1024));
         }
         pspDebugScreenSetTextColor(0xFFFFFFFF);
         printf("\n  UP/DOWN select, X confirm, O cancel\n");
@@ -1574,11 +1658,11 @@ static void transfer_from_es(void)
     const ExtremeSpeedEntry *ent = (const ExtremeSpeedEntry *)(table_buf + active_indices[sel] * ES_ENTRY_SIZE);
 
     pspDebugScreenClear();
-    printf("Transferring back: %s\n", ent->filename);
+    printf("Transferring back: %s\n", pool_get(ent));
     printf("Size: %lu MB\n\n", ent->size_lo / (1024*1024));
 
     char dest[300];
-    snprintf(dest, sizeof(dest), "ms0:/%s", ent->filename);
+    snprintf(dest, sizeof(dest), "ms0:/%s", pool_get(ent));
     ensure_parent_dirs(dest);
 
     SceUID dst = sceIoOpen(dest, PSP_O_WRONLY | PSP_O_CREAT | PSP_O_TRUNC, 0777);
@@ -1684,6 +1768,7 @@ static void delete_iso(void)
         devctl_read_sectors(es_info.partition_start_sector + 1 + s,
                              table_buf + s * 512, 1);
     }
+    pool_refresh(es_info.partition_start_sector);
 
     int active_indices[ES_MAX_ISOS];
     int active_count = 0;
@@ -1711,7 +1796,7 @@ static void delete_iso(void)
             if (i == sel) pspDebugScreenSetTextColor(0xFF0000FF);
             else pspDebugScreenSetTextColor(0xFFFFFFFF);
             printf("  %s %-40.40s %4lu MB\n",
-                   (i == sel) ? ">" : " ", ent->filename, ent->size_lo / (1024*1024));
+                   (i == sel) ? ">" : " ", pool_get(ent), ent->size_lo / (1024*1024));
         }
         pspDebugScreenSetTextColor(0xFFFFFFFF);
         printf("\n  UP/DOWN select, X delete, O cancel\n");
@@ -1728,7 +1813,7 @@ static void delete_iso(void)
     ExtremeSpeedEntry *ent = (ExtremeSpeedEntry *)(table_buf + active_indices[sel] * ES_ENTRY_SIZE);
 
     pspDebugScreenClear();
-    printf("Delete: %s\n\n", ent->filename);
+    printf("Delete: %s\n\n", pool_get(ent));
     pspDebugScreenSetTextColor(0xFF0000FF);
     printf("Press START to confirm, O to cancel.\n");
     pspDebugScreenSetTextColor(0xFFFFFFFF);
@@ -1865,28 +1950,39 @@ static void transfer_all_to_es(void)
         unsigned int new_idx = sb->iso_count;
         if (new_idx >= ES_MAX_ISOS) { printf(" table full\n"); failed++; continue; }
 
+        char fullname[ES_NAME_MAX_LEN];
+        int fullname_len = snprintf(fullname, sizeof(fullname), "ISO/%s", iso_names[fi]);
+        if (fullname_len <= 0 || fullname_len >= ES_NAME_MAX_LEN) {
+            printf(" name too long\n"); failed++; continue;
+        }
+        unsigned int pool_used = sb->pool_used_bytes;
+        unsigned int name_off = pool_append_name(info.partition_start_sector,
+                                                  pool_used, fullname, fullname_len);
+        if (name_off == 0xFFFFFFFFu) {
+            printf(" name pool full\n"); failed++; continue;
+        }
+
         ExtremeSpeedEntry entry;
         memset(&entry, 0, sizeof(entry));
-        snprintf(entry.filename, ES_FILENAME_SIZE, "ISO/%.251s", iso_names[fi]);
         memcpy(entry.game_id, game_id_bulk, ES_GAME_ID_SIZE);
         entry.start_sector = info.free_sector;
         entry.size_sectors = needed_sectors;
         entry.size_lo = file_size;
         entry.flags = ES_FLAG_ACTIVE;
+        entry.name_off = name_off;
+        entry.name_len = (uint16_t)fullname_len;
 
+        // 8 entries per 64-byte slot, 8 fit per sector → never crosses (we could allow more but who's really gonna put more than 632 ISOs on their stick?)
         unsigned int ent_byte_off = new_idx * ES_ENTRY_SIZE;
         unsigned int ent_sec = 1 + (ent_byte_off / 512);
         unsigned int ent_sec_off = ent_byte_off % 512;
-        unsigned char ent_buf[1024] __attribute__((aligned(64)));
+        unsigned char ent_buf[512] __attribute__((aligned(64)));
         devctl_read_sectors(info.partition_start_sector + ent_sec, ent_buf, 1);
-        if (ent_sec_off + ES_ENTRY_SIZE > 512)
-            devctl_read_sectors(info.partition_start_sector + ent_sec + 1, ent_buf + 512, 1);
         memcpy(ent_buf + ent_sec_off, &entry, ES_ENTRY_SIZE);
         devctl_write_sectors(info.partition_start_sector + ent_sec, ent_buf, 1);
-        if (ent_sec_off + ES_ENTRY_SIZE > 512)
-            devctl_write_sectors(info.partition_start_sector + ent_sec + 1, ent_buf + 512, 1);
 
         sb->iso_count = new_idx + 1;
+        sb->pool_used_bytes = pool_used + fullname_len + 1;  // +1 for NUL
         write_superblock_with_backup(info.partition_start_sector, sb_buf);
         info.free_sector += needed_sectors;
 
@@ -1937,6 +2033,7 @@ static void transfer_all_from_es(void)
     unsigned int s;
     for (s = 0; s < table_sectors; s++)
         devctl_read_sectors(es_info.partition_start_sector + 1 + s, table_buf + s * 512, 1);
+    pool_refresh(es_info.partition_start_sector);
 
     int active_count = 0;
     unsigned int idx;
@@ -1977,10 +2074,10 @@ static void transfer_all_from_es(void)
         fi_num++;
 
         printf("  [%d/%d] %s (%lu MB)...", fi_num, active_count,
-               ent->filename, ent->size_lo / (1024*1024));
+               pool_get(ent), ent->size_lo / (1024*1024));
 
         char dest[300];
-        snprintf(dest, sizeof(dest), "ms0:/%s", ent->filename);
+        snprintf(dest, sizeof(dest), "ms0:/%s", pool_get(ent));
 
         SceUID dst = sceIoOpen(dest, PSP_O_WRONLY | PSP_O_CREAT | PSP_O_TRUNC, 0777);
         if (dst < 0) { printf(" create fail\n"); failed++; continue; }
@@ -2076,6 +2173,7 @@ static void compact_es(void)
     unsigned int s;
     for (s = 0; s < table_sectors; s++)
         devctl_read_sectors(es_info.partition_start_sector + 1 + s, table_buf + s * 512, 1);
+    pool_refresh(es_info.partition_start_sector);
 
     int active[ES_MAX_ISOS];
     int active_count = 0;
@@ -2105,7 +2203,7 @@ static void compact_es(void)
     for (ai = 0; ai < active_count; ai++) {
         ExtremeSpeedEntry *ent = (ExtremeSpeedEntry *)(table_buf + active[ai] * ES_ENTRY_SIZE);
         printf("  [%d] idx=%d start=%lu size=%lu %s\n",
-               ai, active[ai], ent->start_sector, ent->size_sectors, ent->filename);
+               ai, active[ai], ent->start_sector, ent->size_sectors, pool_get(ent));
     }
 
     // check if compaction is needed
@@ -2162,7 +2260,7 @@ static void compact_es(void)
         unsigned int dst = next_free;
         unsigned int sectors_left = ent->size_sectors;
 
-        printf("  [%d/%d] %s", ai + 1, active_count, ent->filename);
+        printf("  [%d/%d] %s", ai + 1, active_count, pool_get(ent));
         if (src == dst) {
             printf(" — already in place\n");
             next_free += sectors_left;

@@ -11,9 +11,21 @@
 int es_initialized = 0;
 int es_iso_count = 0;
 ExtremeSpeedEntry es_table[ES_MAX_ISOS];
+static unsigned char es_name_pool[ES_NAME_POOL_BYTES] __attribute__((aligned(64)));
 static unsigned int es_partition_start = 0;
 static unsigned int es_data_start_sec = 0;
 char es_dir_paths[16][256];
+
+// resolve entry [idx]'s name via the in RAM pool and return "" for invalid entries
+static const char *es_get_name(int idx)
+{
+    if (idx < 0 || idx >= ES_MAX_ISOS) return "";
+    const ExtremeSpeedEntry *e = &es_table[idx];
+    if (e->name_len == 0) return "";
+    if (e->name_off >= ES_NAME_POOL_BYTES) return "";
+    if ((unsigned int)e->name_off + (unsigned int)e->name_len >= ES_NAME_POOL_BYTES) return "";
+    return (const char *)&es_name_pool[e->name_off];
+}
 
 // cache blk_fd locally to try and avoid cross-translation unit accessor calls on every read (I couldn't get the POC to work without this tbh)
 static int es_cached_blk_fd = -1;
@@ -100,7 +112,7 @@ static int es_find_iso(const char *file)
     int i;
     for (i = 0; i < es_iso_count; i++) {
         if (!(es_table[i].flags & ES_FLAG_ACTIVE)) continue;
-        if (es_stricmp(file, es_table[i].filename) == 0)
+        if (es_stricmp(file, es_get_name(i)) == 0)
             return i;
     }
     return -1;
@@ -119,7 +131,8 @@ int es_check_dir_prefix(const char *dir)
     int i;
     for (i = 0; i < es_iso_count; i++) {
         if (!(es_table[i].flags & ES_FLAG_ACTIVE)) continue;
-        const char *fn = es_table[i].filename;
+        const char *fn = es_get_name(i);
+        if (es_table[i].name_len <= (uint16_t)dlen) continue;
         int match = 1, j;
         for (j = 0; j < dlen; j++) {
             char a = fn[j], b = dir[j];
@@ -165,7 +178,7 @@ typedef struct {
     char lfn_buf[256]; // 56 pin this down!!
     int lfn_ready;
     int no_fat_chain;
-    int parent_no_fat_chain; // 320 pinm htis down too!! 
+    int parent_no_fat_chain; // 320 pinm htis down too!!
     unsigned int sfn_sector; // 324
     unsigned int sfn_index;
     int msstor_fd;
@@ -262,8 +275,12 @@ int es_try_remove(const char *file)
 
     es_table[idx].flags &= ~ES_FLAG_ACTIVE;
 
-    // switch to stricter atomic writes, previous attempt kinda messes with cross sector etc..
-    es_write_abs(es_partition_start + 1 + idx, &es_table[idx], 1);
+    unsigned int sec = (unsigned int)idx / ES_ENTRIES_PER_SECTOR;
+    unsigned int slot = (unsigned int)idx % ES_ENTRIES_PER_SECTOR;
+    static unsigned char rmw_buf[512] __attribute__((aligned(64)));
+    if (es_read_abs(es_partition_start + 1 + sec, rmw_buf, 1) < 0) return -1;
+    memcpy(rmw_buf + slot * ES_ENTRY_SIZE, &es_table[idx], ES_ENTRY_SIZE);
+    es_write_abs(es_partition_start + 1 + sec, rmw_buf, 1);
     return 0;
 }
 
@@ -341,11 +358,11 @@ int es_dread_overlay(int fd, SceIoDirent *dir, int *iter)
             int cur = idx++;
 
             if (!(es_table[cur].flags & ES_FLAG_ACTIVE)) continue;
-            if (!es_table[cur].filename[0]) continue;
+            if (es_table[cur].name_len == 0) continue;
 
-            // extract directory and basename from es_table filename.
+            // extract directory and basename from the name pool entry.
             // filenames look like "ISO/game.iso" or "ISO/Genre/game.iso".
-            const char *fn = es_table[cur].filename;
+            const char *fn = es_get_name(cur);
             const char *last_slash = 0;
             const char *p;
             for (p = fn; *p; p++) {
@@ -408,10 +425,10 @@ int es_dread_overlay(int fd, SceIoDirent *dir, int *iter)
     while (idx < es_iso_count) {
         int cur = idx++;
         if (!(es_table[cur].flags & ES_FLAG_ACTIVE)) continue;
-        if (!es_table[cur].filename[0]) continue;
+        if (es_table[cur].name_len == 0) continue;
 
         char sub_name[256];
-        int slen = es_extract_subdir(es_table[cur].filename, opened_dir,
+        int slen = es_extract_subdir(es_get_name(cur), opened_dir,
                                       opened_len, sub_name);
         if (slen <= 0) continue;
 
@@ -420,9 +437,9 @@ int es_dread_overlay(int fd, SceIoDirent *dir, int *iter)
         int k;
         for (k = 0; k < cur; k++) {
             if (!(es_table[k].flags & ES_FLAG_ACTIVE)) continue;
-            if (!es_table[k].filename[0]) continue;
+            if (es_table[k].name_len == 0) continue;
             char prev[256];
-            int plen = es_extract_subdir(es_table[k].filename, opened_dir,
+            int plen = es_extract_subdir(es_get_name(k), opened_dir,
                                           opened_len, prev);
             if (plen != slen) continue;
             int eq = 1, m;
@@ -482,7 +499,7 @@ int es_init_partition(unsigned int partition_start)
     es_initialized = 0;
     es_iso_count = 0;
     // invalidate the cached fd on reinit other wise the stale fd prevents games from running
-    // the controller doesn't handle this with sony's default setup right? 
+    // the controller doesn't handle this with sony's default setup right?
     es_cached_blk_fd = -1;
     es_cached_pos = 0xFFFFFFFFFFFFFFFFULL;
     es_data_start_sec = 0;
@@ -502,11 +519,34 @@ int es_init_partition(unsigned int partition_start)
     if (count > ES_MAX_ISOS) count = ES_MAX_ISOS;
 
     if (count > 0) {
-        int i;
-        for (i = 0; i < count; i++) {
-            r = es_read_abs(partition_start + 1 + i, &es_table[i], 1);
+        unsigned char buf[512] __attribute__((aligned(64)));
+        int sectors_needed = (count + ES_ENTRIES_PER_SECTOR - 1) / ES_ENTRIES_PER_SECTOR;
+        int s;
+        for (s = 0; s < sectors_needed; s++) {
+            r = es_read_abs(partition_start + 1 + s, buf, 1);
             if (r < 0) return -4;
+            int base = s * ES_ENTRIES_PER_SECTOR;
+            int n = count - base;
+            if (n > ES_ENTRIES_PER_SECTOR) n = ES_ENTRIES_PER_SECTOR;
+            int i;
+            for (i = 0; i < n; i++) {
+                memcpy(&es_table[base + i],
+                       buf + i * ES_ENTRY_SIZE,
+                       ES_ENTRY_SIZE);
+            }
         }
+    }
+
+    {
+        memset(es_name_pool, 0, sizeof(es_name_pool));
+        int s;
+        for (s = 0; s < ES_NAME_POOL_SECTORS; s++) {
+            r = es_read_abs(partition_start + ES_NAME_POOL_START_SECTOR + s,
+                            &es_name_pool[s * ES_SECTOR_SIZE], 1);
+            if (r < 0) return -5;
+        }
+        // force the very last byte to 0 so a malformed entry whose name_off+name_len lands at the end still reads as terminated
+        es_name_pool[ES_NAME_POOL_BYTES - 1] = 0;
     }
 
     es_iso_count = count;

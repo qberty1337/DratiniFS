@@ -1847,7 +1847,9 @@ static unsigned int exfat_find_in_dir(unsigned int dir_cluster,
                                        unsigned int *out_size,
                                        unsigned char *out_attr,
                                        int *out_no_fat_chain,
-                                       int dir_no_chain)
+                                       int dir_no_chain,
+                                       unsigned int *out_sfn_sector,
+                                       unsigned int *out_sfn_index)
 {
     unsigned int cluster = dir_cluster;
     unsigned char buf[512] __attribute__((aligned(64)));
@@ -1879,6 +1881,8 @@ static unsigned int exfat_find_in_dir(unsigned int dir_cluster,
                 char collected_name[256];
                 int name_pos = 0;
                 int subs_read = 0;
+                unsigned int captured_stream_sec = 0;
+                unsigned int captured_stream_off = 0;
 
                 // ok,advance to next entry
                 unsigned int eoff = off + 32;
@@ -1910,6 +1914,9 @@ static unsigned int exfat_find_in_dir(unsigned int dir_cluster,
                         first_cl = se->first_cluster;
                         fsize = (unsigned int)se->data_length;
                         no_chain = (se->general_flags & 0x02) ? 1 : 0;
+                        captured_stream_sec = exfat_data_start_sector
+                            + (ecluster - 2) * exfat_sectors_per_cluster + esec;
+                        captured_stream_off = eoff;
                     } else if (st == EXFAT_ENTRY_NAME) {
                         ExFatNameEntry *ne = (ExFatNameEntry *)(buf + eoff);
                         int k;
@@ -1944,6 +1951,8 @@ static unsigned int exfat_find_in_dir(unsigned int dir_cluster,
                     if (file_attr & EXFAT_ATTR_ARCHIVE) a |= FAT_ATTR_ARCHIVE;
                     if (out_attr) *out_attr = a;
                     if (out_no_fat_chain) *out_no_fat_chain = no_chain;
+                    if (out_sfn_sector) *out_sfn_sector = captured_stream_sec;
+                    if (out_sfn_index) *out_sfn_index = captured_stream_off;
                     return first_cl;
                 }
 
@@ -1962,16 +1971,20 @@ done:
     return 0;
 }
 
-// resolve a full path like "PSP/GAME/EBOOT.PBP" on exfat here we go
-static unsigned int exfat_resolve_path(const char *path,
-                                        unsigned int *out_size,
-                                        unsigned char *out_attr,
-                                        int *out_no_fat_chain)
+// resolve a full path like "PSP/GAME/EBOOT.PBP" on exfat, this should help fix DATAINSTALL
+static unsigned int exfat_resolve_path_ex(const char *path,
+                                           unsigned int *out_size,
+                                           unsigned char *out_attr,
+                                           int *out_no_fat_chain,
+                                           unsigned int *out_sfn_sector,
+                                           unsigned int *out_sfn_index)
 {
     unsigned int cluster = exfat_root_cluster;
     unsigned char attr = FAT_ATTR_DIRECTORY;
     unsigned int size = 0;
     int no_chain = 0;
+    unsigned int last_sfn_sec = 0;
+    unsigned int last_sfn_idx = 0;
 
     // skip leading slash manually
     while (*path == '/') path++;
@@ -1994,14 +2007,27 @@ static unsigned int exfat_resolve_path(const char *path,
             return 0;
 
         int parent_nc = no_chain;
-        cluster = exfat_find_in_dir(cluster, component, &size, &attr, &no_chain, parent_nc);
+        last_sfn_sec = 0; last_sfn_idx = 0;
+        cluster = exfat_find_in_dir(cluster, component, &size, &attr, &no_chain, parent_nc,
+                                     &last_sfn_sec, &last_sfn_idx);
         if (cluster == 0) return 0;
     }
 
     if (out_size) *out_size = size;
     if (out_attr) *out_attr = attr;
     if (out_no_fat_chain) *out_no_fat_chain = no_chain;
+    if (out_sfn_sector) *out_sfn_sector = last_sfn_sec;
+    if (out_sfn_index)  *out_sfn_index  = last_sfn_idx;
     return cluster;
+}
+
+// thin wrapper preserving the v2 signature for 22+ existing call sites that don't needthe stream entry location
+static unsigned int exfat_resolve_path(const char *path,
+                                        unsigned int *out_size,
+                                        unsigned char *out_attr,
+                                        int *out_no_fat_chain)
+{
+    return exfat_resolve_path_ex(path, out_size, out_attr, out_no_fat_chain, NULL, NULL);
 }
 
 // annoying vfs handlers
@@ -2065,7 +2091,7 @@ static int exfat_IoOpen(PspIoDrvFileArg *arg, char *file, int flags, SceMode mod
 
         if (g_use_exfat) {
             int nc = 0;
-            cluster = exfat_resolve_path(file, &size, &attr, &nc);
+            cluster = exfat_resolve_path_ex(file, &size, &attr, &nc, &sfn_sec, &sfn_idx);
             no_chain = nc;
         } else {
             cluster = fat32_resolve_path_ex(file, &size, &attr, &sfn_sec, &sfn_idx);
@@ -2103,6 +2129,11 @@ static int exfat_IoOpen(PspIoDrvFileArg *arg, char *file, int flags, SceMode mod
                 if (wret < 0) { exfat_free_cluster(cluster); return -1; }
                 no_chain = 0;
                 attr = FAT_ATTR_ARCHIVE;
+                {
+                    unsigned int dz = 0; unsigned char da = 0; int dnc = 0;
+                    exfat_find_in_dir(parent_cluster, fname2, &dz, &da, &dnc, parent_nfc,
+                                      &sfn_sec, &sfn_idx);
+                }
                 goto skip_fat32_creat;
             }
             const char *slash = file;
@@ -2445,6 +2476,19 @@ static int exfat_IoWrite(PspIoDrvFileArg *arg, const char *data, int len)
                     de->attr |= FAT_ATTR_ARCHIVE;
                     blk_write_sectors(f->sfn_sector, de_buf, 1);
                     blk_wr_cache_push(f->sfn_sector, de_buf);
+                }
+            }
+            else if (g_use_exfat && f->sfn_sector != 0) {
+                unsigned char se_buf[512] __attribute__((aligned(64)));
+                if (exfat_blk_read_sectors(f->sfn_sector, se_buf, 1) >= 0
+                    && f->sfn_index <= 512 - 32
+                    && se_buf[f->sfn_index] == EXFAT_ENTRY_STREAM)
+                {
+                    ExFatStreamEntry *se = (ExFatStreamEntry *)(se_buf + f->sfn_index);
+                    se->data_length       = (unsigned long long)f->file_size;
+                    se->valid_data_length = (unsigned long long)f->file_size;
+                    se->first_cluster     = f->first_cluster;
+                    exfat_blk_write_sectors(f->sfn_sector, se_buf, 1);
                 }
             }
         }
