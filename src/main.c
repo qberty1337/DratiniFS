@@ -2420,7 +2420,7 @@ static int exfat_IoRead(PspIoDrvFileArg *arg, char *data, int len)
             if (ret < 0)
                 return total_read > 0 ? total_read : ret;
             unsigned int bulk = nsectors * fat32_bytes_per_sector;
-            sceKernelDcacheWritebackInvalidateRange(data, bulk);
+            // no flush here - blk_read_sectors already flushed `data` at the msstor boundary (sony does the same)
             data += bulk; f->position += bulk;
             total_read += bulk; len -= bulk;
             to_read -= bulk; sector += nsectors;
@@ -5331,7 +5331,21 @@ static void deferred_fs_init(void)
                         p[1] = 0x8C420000 | lo;
                         p[2] = 0x03E00008;
                         p[3] = 0x00000000;
+                        // patch 0x0210D024 and 0x0210D025
+                        // mgr.c's FAT i/o layer hits these for capacity, savedata writes still see saturated 57 GiB...
+                        volatile unsigned int *p2 = (volatile unsigned int *)(text_addr + 0x3364);
+                        p2[0] = 0x3C020000 | hi;
+                        p2[1] = 0x8C420000 | lo;
+                        p2[2] = 0x03E00008;
+                        p2[3] = 0x00000000;
+                        volatile unsigned int *p3 = (volatile unsigned int *)(text_addr + 0x3394);
+                        p3[0] = 0x3C020000 | hi;
+                        p3[1] = 0x8C420000 | lo;
+                        p3[2] = 0x03E00008;
+                        p3[3] = 0x00000000;
                         sceKernelDcacheWritebackInvalidateRange((const void *)p, 16);
+                        sceKernelDcacheWritebackInvalidateRange((const void *)p2, 16);
+                        sceKernelDcacheWritebackInvalidateRange((const void *)p3, 16);
                         sceKernelIcacheInvalidateAll();
                     }
                 }
