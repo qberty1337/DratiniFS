@@ -5445,15 +5445,30 @@ static int assign_thread(SceSize args, void *argp)
 {
     (void)args; (void)argp;
 
-    // wait 3s for mediasync to finish initial scan, then reopen the blk_fd
-    sceKernelDelayThread(3000000); // .....yeaaaa let's not do this...
+    // poll msstor instead of fixed 3s sleep - typical case opens in <50ms
+    // open lock-free into a local fd, adopt under mutex with re-check so a concurrent
+    // deferred_fs_init from iodevctl/ioopen can't end up with two fds
     if (blk_fd < 0 && mount_state == 0x1020) {
-        if (fs_mutex >= 0) sceKernelLockMutex(fs_mutex, 1, 0);
-        blk_fd = k_sceIoOpen("msstor0:", 0x04000003, 0);
-        if (fs_mutex >= 0) sceKernelUnlockMutex(fs_mutex, 1);
-        // fire insert callback so the xmb rescans
-        if (blk_fd >= 0) {
-            notify_all_callbacks(1);
+        int local_fd = -1;
+        int retries;
+        for (retries = 0; retries < 60 && mount_state == 0x1020; retries++) {
+            local_fd = k_sceIoOpen("msstor0:", 0x04000003, 0);
+            if (local_fd >= 0) break;
+            sceKernelDelayThread(50000); // 50ms
+        }
+        if (local_fd >= 0) {
+            int adopted = 0;
+            if (fs_mutex >= 0) sceKernelLockMutex(fs_mutex, 1, 0);
+            if (blk_fd < 0 && mount_state == 0x1020) {
+                blk_fd = local_fd;
+                adopted = 1;
+            }
+            if (fs_mutex >= 0) sceKernelUnlockMutex(fs_mutex, 1);
+            if (adopted) {
+                notify_all_callbacks(1); // fire insert callback so xmb rescans
+            } else {
+                k_sceIoClose(local_fd);
+            }
         }
     }
 
