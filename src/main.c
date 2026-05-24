@@ -180,6 +180,7 @@ static unsigned int mbr_find_exfat_partition(const unsigned char *mbr_buf, unsig
 static void fat_current_time(unsigned short *fdate, unsigned short *ftime);
 static unsigned short exfat_entry_checksum(const unsigned char *es, int size);
 static void deferred_fs_init(void);
+static int exfat_bmp_scan_thread_fn(SceSize args, void *argp);
 
 // fat32 fs state
 static unsigned int partition_start_sector = 0;
@@ -5181,6 +5182,69 @@ static unsigned int mbr_find_exfat_partition(const unsigned char *mbr_buf, unsig
     return 0;
 }
 
+// background bitmap scan - mount returns instantly with optimistic exfat_free_clusters,
+// this thread reads the alloc bitmap in 32 kb chunks and overwrites the count when done
+#define EXFAT_BMP_SCAN_CHUNK_SECTORS 64u
+static unsigned char exfat_bmp_scan_buf[EXFAT_BMP_SCAN_CHUNK_SECTORS * 512u] __attribute__((aligned(64)));
+static SceUID exfat_bmp_scan_thid = -1;
+static volatile int exfat_bmp_scan_done = 0;
+
+static int exfat_bmp_scan_thread_fn(SceSize args, void *argp)
+{
+    (void)args; (void)argp;
+
+    if (exfat_bitmap_cluster < 2 || exfat_bitmap_size == 0 || mount_state != 0x1020) {
+        exfat_bmp_scan_done = 1;
+        sceKernelExitDeleteThread(0);
+        return 0;
+    }
+
+    unsigned int bmp_base = exfat_data_start_sector +
+        (exfat_bitmap_cluster - 2) * exfat_sectors_per_cluster;
+    unsigned int total_bytes = exfat_bitmap_size;
+    unsigned int free_count = 0;
+    unsigned int ab = 0;
+
+    while (ab < total_bytes && mount_state == 0x1020) {
+        unsigned int remaining = total_bytes - ab;
+        unsigned int chunk_bytes = remaining > sizeof(exfat_bmp_scan_buf)
+            ? sizeof(exfat_bmp_scan_buf) : remaining;
+        unsigned int chunk_sectors = (chunk_bytes + 511u) / 512u;
+        unsigned int sec = bmp_base + ab / 512u;
+
+        if (exfat_blk_read_sectors(sec, exfat_bmp_scan_buf, chunk_sectors) < 0) {
+            // read failure, abandon the scan and leave optimistic count
+            exfat_bmp_scan_done = 1;
+            sceKernelExitDeleteThread(0);
+            return 0;
+        }
+
+        unsigned int byte_off;
+        for (byte_off = 0; byte_off < chunk_bytes; byte_off++) {
+            unsigned char b = exfat_bmp_scan_buf[byte_off];
+            if (b == 0xFF) continue;
+            int bit;
+            for (bit = 0; bit < 8; bit++) {
+                if (!(b & (1 << bit))) free_count++;
+            }
+        }
+
+        ab += chunk_bytes;
+    }
+
+    if (mount_state == 0x1020) {
+        if (free_count > exfat_cluster_count) free_count = exfat_cluster_count;
+        // single-cpu, plain stores publish atomically. concurrent alloc/free during the
+        // scan window has bounded error (~writes-per-second * scan-seconds) so just overwrite
+        exfat_free_clusters = free_count;
+        fat32_free_clusters = free_count;
+    }
+
+    exfat_bmp_scan_done = 1;
+    sceKernelExitDeleteThread(0);
+    return 0;
+}
+
 // deferred init is called from iodevctl/ioopen when msstor is probably ready
 // retries if msstor0 not yet available, can be called multiple times safely
 // THIS is probably the cause of the race condition issues plaguing this driver relating to DATAINSTALL games...
@@ -5329,36 +5393,14 @@ static void deferred_fs_init(void)
         fat32_total_clusters      = exfat_cluster_count;
         fat32_total_sectors       = exfat_volume_sectors;
         fat_cached_sector         = 0xFFFFFFFF;
-        // cache exfat free cluster count from bitmap at init
-        // if we don't do this it breaks free space reporting...
-        // I dunno... mayvbe there's a faster way?... I need more coffee...
-        if (exfat_bitmap_cluster >= 2 && exfat_bitmap_size > 0) {
-            unsigned int bmp_base = exfat_data_start_sector +
-                (exfat_bitmap_cluster - 2) * exfat_sectors_per_cluster;
-            unsigned char bmp[512] __attribute__((aligned(64)));
-            unsigned int free_count = 0;
-            unsigned int total_bytes = exfat_bitmap_size;
-            unsigned int ab = 0;
-            while (ab < total_bytes) {
-                unsigned int sec = bmp_base + ab / 512;
-                if (exfat_blk_read_sectors(sec, bmp, 1) < 0) break;
-                unsigned int start = ab % 512;
-                unsigned int end = total_bytes - (ab / 512) * 512;
-                if (end > 512) end = 512;
-                unsigned int off;
-                for (off = start; off < end; off++) {
-                    if (bmp[off] == 0xFF) continue;
-                    int bit;
-                    for (bit = 0; bit < 8; bit++) {
-                        if (!(bmp[off] & (1 << bit))) free_count++;
-                    }
-                }
-                ab = (ab / 512 + 1) * 512;
-            }
-            exfat_free_clusters = free_count;
-        }
-        // mirror to fat32 globals to satisfy those code paths that love 'em so much
-        fat32_free_clusters = exfat_free_clusters;
+        // optimistic count, scan thread overwrites with real value (mount returns instantly)
+        exfat_free_clusters = exfat_cluster_count;
+        fat32_free_clusters = exfat_cluster_count;
+        exfat_bmp_scan_done = 0;
+        exfat_bmp_scan_thid = sceKernelCreateThread("SceFatmsBmpScan",
+            exfat_bmp_scan_thread_fn, 0x68, 0x1000, 0x00100001, NULL);
+        if (exfat_bmp_scan_thid >= 0)
+            sceKernelStartThread(exfat_bmp_scan_thid, 0, NULL);
     } else {
         g_use_exfat = 0;
         ret = fat32_init();
