@@ -293,7 +293,8 @@ static void fat_big_cache_alloc(void)
         return;
     }
     fat_big_cache_free();
-    SceUID id = sceKernelAllocPartitionMemory(2, "FatmsFatCache", 1,
+    // partition 1 = kernel - matches every other Fpl in this module (SceFatfsFdBuf etc).
+    SceUID id = sceKernelAllocPartitionMemory(1, "FatmsFatCache", 1,
                                               want * 512u, NULL);
     if (id < 0) return;
     void *p = sceKernelGetBlockHeadAddr(id);
@@ -334,11 +335,18 @@ static PspSysEventHandler fatms_sysevent = {
 };
 
 // write-through sector cache - moved above sysevent handler so suspend/eject can invalidate
-#define BLK_WR_CACHE_ENTRIES 2
+// bumped from 2 to 32 - 2 evicted on any pair of non-adjacent writes, cluster-chain writes thrashed
+#define BLK_WR_CACHE_ENTRIES 32
 static unsigned char blk_wr_cache[BLK_WR_CACHE_ENTRIES][512] __attribute__((aligned(64)));
-static unsigned int blk_wr_cache_sector[BLK_WR_CACHE_ENTRIES] = { 0xFFFFFFFF, 0xFFFFFFFF };
-static int blk_wr_cache_age[BLK_WR_CACHE_ENTRIES] = { 0, 0 };
+static unsigned int blk_wr_cache_sector[BLK_WR_CACHE_ENTRIES] = { [0 ... BLK_WR_CACHE_ENTRIES-1] = 0xFFFFFFFF };
+static int blk_wr_cache_age[BLK_WR_CACHE_ENTRIES] = {0};
 static int blk_wr_cache_clock = 0;
+
+static inline void blk_wr_cache_invalidate_all(void)
+{
+    int i;
+    for (i = 0; i < BLK_WR_CACHE_ENTRIES; i++) blk_wr_cache_sector[i] = 0xFFFFFFFF;
+}
 
 // exfat state
 // never touches partition_start_sector or fat32_* (which the other threads use)
@@ -397,8 +405,7 @@ static int fatms_sysevent_handler(int ev_id, char *ev_name, void *param, int *re
         fat_cached_sector = 0xFFFFFFFF;
         exfat_fat_cached_sector = 0xFFFFFFFF;
         fat_big_cache_invalidate_all();
-        blk_wr_cache_sector[0] = 0xFFFFFFFF;
-        blk_wr_cache_sector[1] = 0xFFFFFFFF;
+        blk_wr_cache_invalidate_all();
         break;
     case 0x00010000:
         // resume / usb exit
@@ -411,8 +418,7 @@ static int fatms_sysevent_handler(int ev_id, char *ev_name, void *param, int *re
             blk_fd = -1; blk_fd_pos = 0xFFFFFFFFFFFFFFFFULL;
         }
         blk_fd_validated = 0;
-        blk_wr_cache_sector[0] = 0xFFFFFFFF;
-        blk_wr_cache_sector[1] = 0xFFFFFFFF;
+        blk_wr_cache_invalidate_all();
         mount_state = 0x1022;
         media_flags = 0x4000;
         notify_all_callbacks(2);
@@ -456,7 +462,56 @@ typedef struct {
     unsigned int sfn_sector;       // sector containing this file's 8.3 dir entry
     unsigned int sfn_index;        // byte offset of entry within that sector
     SceUID msstor_fd;        // per-file msstor fd (like sony's per-file struct[116]) - no wayh around this for now
+    // backward-seek checkpoints - skips re-walk from cluster 0 on backward seeks in big files
+    // recorded at end of each ioread/iowrite that moved past min stride from the last ckpt
+    unsigned int ckpt_idx[8];
+    unsigned int ckpt_cluster[8];
+    unsigned char ckpt_count;
+    unsigned char ckpt_next;
 } OpenFile;
+
+#define CHAIN_CKPT_COUNT 8
+#define CHAIN_CKPT_MIN_STRIDE 32u  // don't cluster ckpts closer than this
+
+static inline void chain_ckpt_reset(OpenFile *f)
+{
+    f->ckpt_count = 0;
+    f->ckpt_next = 0;
+}
+
+static inline void chain_ckpt_record(OpenFile *f)
+{
+    if (f->no_fat_chain || f->cur_cluster_index == 0) return;
+    if (f->cur_cluster < 2 || f->cur_cluster >= FAT32_EOC) return;
+    if (f->ckpt_count > 0) {
+        unsigned int last = f->ckpt_idx[(f->ckpt_next + CHAIN_CKPT_COUNT - 1) % CHAIN_CKPT_COUNT];
+        if (f->cur_cluster_index <= last + CHAIN_CKPT_MIN_STRIDE) return;
+    }
+    f->ckpt_idx[f->ckpt_next] = f->cur_cluster_index;
+    f->ckpt_cluster[f->ckpt_next] = f->cur_cluster;
+    f->ckpt_next = (f->ckpt_next + 1) % CHAIN_CKPT_COUNT;
+    if (f->ckpt_count < CHAIN_CKPT_COUNT) f->ckpt_count++;
+}
+
+// for backward seek: jump to nearest ckpt <= target, else first_cluster
+// ckpts with stale/invalid cluster values are skipped so a corrupted record can't poison a seek
+static inline void chain_ckpt_seek_back(OpenFile *f, unsigned int target_idx)
+{
+    unsigned int best_idx = 0;
+    unsigned int best_cluster = f->first_cluster;
+    int i;
+    for (i = 0; i < f->ckpt_count; i++) {
+        unsigned int ci = f->ckpt_idx[i];
+        unsigned int cc = f->ckpt_cluster[i];
+        if (cc < 2 || cc >= FAT32_EOC) continue;
+        if (ci <= target_idx && ci > best_idx) {
+            best_idx = ci;
+            best_cluster = cc;
+        }
+    }
+    f->cur_cluster_index = best_idx;
+    f->cur_cluster = best_cluster;
+}
 
 static OpenFile open_files[MAX_OPEN_FILES];
 
@@ -1952,6 +2007,11 @@ static unsigned int exfat_find_in_dir(unsigned int dir_cluster,
     unsigned char buf[512] __attribute__((aligned(64)));
     unsigned int iter = 0;
 
+    // precompute namehash so we can skip the full name collect + ascii compare on streamentry mismatch
+    int name_len = 0;
+    while (name[name_len]) name_len++;
+    unsigned short search_hash = exfat_name_hash(name, name_len);
+
     while (cluster >= 2 && cluster < FAT32_EOC && iter < exfat_cluster_count) {
         iter++;
         unsigned int sec_base = exfat_data_start_sector +
@@ -1980,6 +2040,7 @@ static unsigned int exfat_find_in_dir(unsigned int dir_cluster,
                 int subs_read = 0;
                 unsigned int captured_stream_sec = 0;
                 unsigned int captured_stream_off = 0;
+                int name_hash_mismatch = 0;
 
                 // ok,advance to next entry
                 unsigned int eoff = off + 32;
@@ -2014,7 +2075,10 @@ static unsigned int exfat_find_in_dir(unsigned int dir_cluster,
                         captured_stream_sec = exfat_data_start_sector
                             + (ecluster - 2) * exfat_sectors_per_cluster + esec;
                         captured_stream_off = eoff;
-                    } else if (st == EXFAT_ENTRY_NAME) {
+                        // short-circuit: length + hash filter before any name byte work
+                        if (se->name_length != name_len || se->name_hash != search_hash)
+                            name_hash_mismatch = 1;
+                    } else if (st == EXFAT_ENTRY_NAME && !name_hash_mismatch) {
                         ExFatNameEntry *ne = (ExFatNameEntry *)(buf + eoff);
                         int k;
                         for (k = 0; k < 15 && name_pos < 255; k++) {
@@ -2029,17 +2093,20 @@ static unsigned int exfat_find_in_dir(unsigned int dir_cluster,
 
                 collected_name[name_pos] = '\0';
 
-                const char *a = name;
-                const char *b = collected_name;
-                int match = 1;
-                while (*a && *b) {
-                    char ca = *a, cb = *b;
-                    if (ca >= 'a' && ca <= 'z') ca -= 32;
-                    if (cb >= 'a' && cb <= 'z') cb -= 32;
-                    if (ca != cb) { match = 0; break; }
-                    a++; b++;
+                int match = 0;
+                if (!name_hash_mismatch) {
+                    const char *a = name;
+                    const char *b = collected_name;
+                    match = 1;
+                    while (*a && *b) {
+                        char ca = *a, cb = *b;
+                        if (ca >= 'a' && ca <= 'z') ca -= 32;
+                        if (cb >= 'a' && cb <= 'z') cb -= 32;
+                        if (ca != cb) { match = 0; break; }
+                        a++; b++;
+                    }
+                    if (*a || *b) match = 0;
                 }
-                if (*a || *b) match = 0;
 
                 if (match && first_cl >= 2) {
                     if (out_size) *out_size = fsize;
@@ -2345,6 +2412,7 @@ static int exfat_IoOpen(PspIoDrvFileArg *arg, char *file, int flags, SceMode mod
     open_files[fd].sfn_sector         = sfn_sec;
     open_files[fd].sfn_index          = sfn_idx;
     open_files[fd].msstor_fd          = -1; // unused - sony uses single per-mount fd
+    chain_ckpt_reset(&open_files[fd]);
 
     arg->arg = (void *)fd;
     return 0;
@@ -2422,7 +2490,9 @@ static int exfat_IoRead(PspIoDrvFileArg *arg, char *data, int len)
             if (ret < 0)
                 return total_read > 0 ? total_read : ret;
             unsigned int bulk = nsectors * fat32_bytes_per_sector;
-            // no flush here - blk_read_sectors already flushed `data` at the msstor boundary (sony does the same)
+            // sony flushes per-sector after every read in df_read... this is just really bad design for this setup here
+            // blk_read_sectors already flushes too but redundancy is cheap insurance here... i dunno, we have to do this for now even though is slow
+            sceKernelDcacheWritebackInvalidateRange(data, bulk);
             data += bulk; f->position += bulk;
             total_read += bulk; len -= bulk;
             to_read -= bulk; sector += nsectors;
@@ -2479,6 +2549,7 @@ static int exfat_IoWrite(PspIoDrvFileArg *arg, const char *data, int len)
             f->tail_cluster      = f->first_cluster;
             f->cur_cluster       = f->first_cluster;
             f->cur_cluster_index = 0;
+            chain_ckpt_reset(f); // first_cluster changed - old ckpts are from a different chain
             wc = f->first_cluster;
             offset_in_cluster = 0;
         } else {
@@ -4064,8 +4135,7 @@ static int exfat_IoDevctl(PspIoDrvFileArg *arg, const char *devname,
         fat_cached_sector = 0xFFFFFFFF;
         exfat_fat_cached_sector = 0xFFFFFFFF;
         fat_big_cache_invalidate_all();
-        blk_wr_cache_sector[0] = 0xFFFFFFFF;
-        blk_wr_cache_sector[1] = 0xFFFFFFFF;
+        blk_wr_cache_invalidate_all();
         dir_rd_cache_invalidate();
         // force the full reinit on the next vfs call
         fs_initialized = 0;
@@ -5221,8 +5291,19 @@ static int exfat_bmp_scan_thread_fn(SceSize args, void *argp)
         unsigned int chunk_sectors = (chunk_bytes + 511u) / 512u;
         unsigned int sec = bmp_base + ab / 512u;
 
-        if (exfat_blk_read_sectors(sec, exfat_bmp_scan_buf, chunk_sectors) < 0) {
-            // read failure, abandon the scan and leave optimistic count
+        // must hold fs_mutex during the read - vfs handlers share blk_fd / blk_fd_pos
+        // without the lock, our seek+read races with foreground reads, stomping blk_fd_pos
+        // and returning data from the wrong sector (causes heavy-streaming game crashes)
+        int ret;
+        if (fs_mutex >= 0) sceKernelLockMutex(fs_mutex, 1, 0);
+        if (mount_state == 0x1020 && blk_fd >= 0)
+            ret = exfat_blk_read_sectors(sec, exfat_bmp_scan_buf, chunk_sectors);
+        else
+            ret = -1; // ejected or fd closed mid-scan, bail
+        if (fs_mutex >= 0) sceKernelUnlockMutex(fs_mutex, 1);
+
+        if (ret < 0) {
+            // read failure or eject, abandon the scan and leave optimistic count
             exfat_bmp_scan_done = 1;
             sceKernelExitDeleteThread(0);
             return 0;
@@ -5340,21 +5421,7 @@ static void do_mount_work_inner(void)
                         p[1] = 0x8C420000 | lo;
                         p[2] = 0x03E00008;
                         p[3] = 0x00000000;
-                        // patch 0x0210D024 and 0x0210D025
-                        // mgr.c's FAT i/o layer hits these for capacity, savedata writes still see saturated 57 GiB...
-                        volatile unsigned int *p2 = (volatile unsigned int *)(text_addr + 0x3364);
-                        p2[0] = 0x3C020000 | hi;
-                        p2[1] = 0x8C420000 | lo;
-                        p2[2] = 0x03E00008;
-                        p2[3] = 0x00000000;
-                        volatile unsigned int *p3 = (volatile unsigned int *)(text_addr + 0x3394);
-                        p3[0] = 0x3C020000 | hi;
-                        p3[1] = 0x8C420000 | lo;
-                        p3[2] = 0x03E00008;
-                        p3[3] = 0x00000000;
                         sceKernelDcacheWritebackInvalidateRange((const void *)p, 16);
-                        sceKernelDcacheWritebackInvalidateRange((const void *)p2, 16);
-                        sceKernelDcacheWritebackInvalidateRange((const void *)p3, 16);
                         sceKernelIcacheInvalidateAll();
                     }
                 }
