@@ -180,6 +180,7 @@ static unsigned int mbr_find_exfat_partition(const unsigned char *mbr_buf, unsig
 static void fat_current_time(unsigned short *fdate, unsigned short *ftime);
 static unsigned short exfat_entry_checksum(const unsigned char *es, int size);
 static void deferred_fs_init(void);
+static void do_mount_work_inner(void);
 static int exfat_bmp_scan_thread_fn(SceSize args, void *argp);
 
 // fat32 fs state
@@ -191,6 +192,7 @@ unsigned long long es_get_blk_fd_pos(void) { return blk_fd_pos; }
 void es_set_blk_fd_pos(unsigned long long pos) { blk_fd_pos = pos; }
 static int g_use_exfat = 0; // 1 = exfat filesystem, 0 = fat32 (should I add fat16 support?)
 static volatile int fs_initialized = 0; // set by deferred_fs_init on first iodevctl
+static volatile int deferred_fs_init_in_progress = 0; // re-entrancy guard so iomount->deferred->sceioassign->iomount doesn't recurse
 static volatile unsigned int g_real_total_sectors = 0;
 
 // detect stale blk_fd -- sceiocloseall kills kernel fds during game launch
@@ -3827,21 +3829,28 @@ static int exfat_IoMount(PspIoDrvFileArg *arg, const char *fs_name,
 {
     (void)arg; (void)fs_name; (void)mode; (void)unk1; (void)unk2;
 
-    // sony's sub_0ba10, it calls block device devctls to initialize
-    if (blockdev && blk_fd >= 0) {
-        k_sceIoDevctl(blockdev, 0x0211D814, NULL, 0, NULL, 0);
-        k_sceIoDevctl(blockdev, 0x0210D816, NULL, 0, NULL, 0);
+    // synchronous mount - matches sony's pattern (mount finishes by the time sceioassign returns)
+    // re-entrancy: if we're already inside deferred_fs_init via a parent sceioassign loop, this no-ops
+    deferred_fs_init();
+
+    // if a recursive inner iomount already set mount_state we're the outer caller, skip the redundant work
+    if (mount_state != 0x1020) {
+        // sony's sub_0ba10, it calls block device devctls to initialize
+        if (blockdev && blk_fd >= 0) {
+            k_sceIoDevctl(blockdev, 0x0211D814, NULL, 0, NULL, 0);
+            k_sceIoDevctl(blockdev, 0x0210D816, NULL, 0, NULL, 0);
+        }
+
+        mount_state = 0x1020;
+        media_flags = 0x2000; // media present flag
+
+        // notify all registered callbacks when card inserted
+        notify_all_callbacks(1);
+
+        // signal the media thread as poer usual
+        if (event_flag_id >= 0)
+            sceKernelSetEventFlag(event_flag_id, EVT_INSERT);
     }
-
-    mount_state = 0x1020;
-    media_flags = 0x2000; // media present flag
-
-    // notify all registered callbacks when card inserted
-    notify_all_callbacks(1);
-
-    // signal the media thread as poer usual
-    if (event_flag_id >= 0)
-        sceKernelSetEventFlag(event_flag_id, EVT_INSERT);
 
     return 0;
 }
@@ -5249,7 +5258,7 @@ static int exfat_bmp_scan_thread_fn(SceSize args, void *argp)
 // retries if msstor0 not yet available, can be called multiple times safely
 // THIS is probably the cause of the race condition issues plaguing this driver relating to DATAINSTALL games...
 
-static void deferred_fs_init(void)
+static void do_mount_work_inner(void)
 {
     if (fs_initialized == 2) return; // fully done
     if (fs_initialized == 0) {
@@ -5453,6 +5462,16 @@ static void deferred_fs_init(void)
 
     // sony never closes blk_fd during normal operation....
     // it's technically more performant on the bit level to keep it open but there's some edge cases...
+}
+
+// wrapper: cheap fast-path + re-entrancy guard so iomount->deferred->sceioassign->iomount doesn't recurse
+static void deferred_fs_init(void)
+{
+    if (fs_initialized == 2) return;
+    if (deferred_fs_init_in_progress) return;
+    deferred_fs_init_in_progress = 1;
+    do_mount_work_inner();
+    deferred_fs_init_in_progress = 0;
 }
 
 static int assign_thread(SceSize args, void *argp)
