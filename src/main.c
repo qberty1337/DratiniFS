@@ -1183,6 +1183,46 @@ static int exfat_build_entry_set(unsigned char *es,
     return es_size;
 }
 
+static unsigned int exfat_walk_for_parent(unsigned int dir_cluster,
+                                          unsigned int target_cluster,
+                                          int depth)
+{
+    if (depth > 8) return 0;
+    unsigned int cl = dir_cluster;
+    unsigned char buf[512] __attribute__((aligned(64)));
+    while (cl >= 2 && cl < FAT32_EOC) {
+        unsigned int sec_base = exfat_data_start_sector
+            + (cl - 2) * exfat_sectors_per_cluster;
+        unsigned int s;
+        for (s = 0; s < exfat_sectors_per_cluster; s++) {
+            if (exfat_blk_read_sectors(sec_base + s, buf, 1) < 0) return 0;
+            unsigned int eo;
+            for (eo = 0; eo + 64 <= 512; eo += 32) {
+                if (buf[eo] == 0x00) return 0;
+                if (buf[eo] != EXFAT_ENTRY_FILE) continue;
+                unsigned char *stream = buf + eo + 32;
+                if (stream[0] != EXFAT_ENTRY_STREAM) continue;
+                ExFatStreamEntry *se = (ExFatStreamEntry *)stream;
+                if (se->first_cluster == target_cluster) return cl;
+                ExFatFileEntry *fe = (ExFatFileEntry *)(buf + eo);
+                if ((fe->file_attributes & EXFAT_ATTR_DIRECTORY) && se->first_cluster >= 2) {
+                    unsigned int r = exfat_walk_for_parent(se->first_cluster,
+                                                          target_cluster, depth + 1);
+                    if (r) return r;
+                }
+            }
+        }
+        cl = exfat_next_cluster(cl);
+    }
+    return 0;
+}
+
+static unsigned int exfat_find_dir_parent(unsigned int target_cluster)
+{
+    if (target_cluster < 2 || target_cluster == exfat_root_cluster) return 0;
+    return exfat_walk_for_parent(exfat_root_cluster, target_cluster, 0);
+}
+
 // write an exfat directory entry set into a parent directory
 // finds contiguous free slots, writes entry set + end-of-dir marker
 // returns 0 on success, -1 on failure
@@ -1256,6 +1296,21 @@ static int exfat_write_dir_entry(unsigned int parent_cluster,
             if (nc == 0) return -1;
             exfat_zero_cluster_ex(nc);
             exfat_write_fat_entry(dcl, nc);
+
+            unsigned int grandparent = exfat_find_dir_parent(parent_cluster);
+            if (grandparent >= 2) {
+                unsigned int n_clusters = 0;
+                unsigned int walk = parent_cluster;
+                while (walk >= 2 && walk < FAT32_EOC) {
+                    n_clusters++;
+                    walk = exfat_next_cluster(walk);
+                    if (n_clusters > 65536) break;
+                }
+                unsigned long long new_size = (unsigned long long)n_clusters * exfat_cluster_size;
+                exfat_update_dir_entry(grandparent, parent_cluster, parent_cluster,
+                                       (unsigned int)new_size, 0);
+            }
+
             dcl = nc;
         } else {
             dcl = next_dcl;
@@ -4672,8 +4727,15 @@ static int exfat_IoDevctl(PspIoDrvFileArg *arg, const char *devname,
     // set and get attrib / rename through devctl
     case 0x0242D81A:
     case 0x0242D81C:
-    case 0x02415830:
         return 0;
+    case 0x02415830:
+        if (!indata || inlen < 8) return 0x80010016;
+        {
+            char *oldname = *(char **)indata;
+            char *newname = *(char **)((char *)indata + 4);
+            if (!oldname || !newname) return 0x80010016;
+            return exfat_IoRename(NULL, oldname, newname);
+        }
     // get partition table and query format (do as sony does!)
     case 0x02415870:
     case 0x0241D81D:
