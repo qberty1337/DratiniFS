@@ -2570,6 +2570,7 @@ static int exfat_IoRead(PspIoDrvFileArg *arg, char *data, int len)
         }
     }
 
+    chain_ckpt_record(f);
     return total_read;
 }
 
@@ -2717,6 +2718,7 @@ static int exfat_IoWrite(PspIoDrvFileArg *arg, const char *data, int len)
         }
     }
 
+    chain_ckpt_record(f);
     return total_written;
 }
 
@@ -2755,8 +2757,7 @@ static SceOff exfat_IoLseek(PspIoDrvFileArg *arg, SceOff ofs, int whence)
     {
         unsigned int new_ci = (unsigned int)new_pos / fat32_cluster_size;
         if (new_ci < f->cur_cluster_index) {
-            f->cur_cluster       = f->first_cluster;
-            f->cur_cluster_index = 0;
+            chain_ckpt_seek_back(f, new_ci);
         }
     }
     return (SceOff)new_pos;
@@ -2783,8 +2784,8 @@ static int exfat_IoIoctl(PspIoDrvFileArg *arg, unsigned int cmd, void *indata, i
         OpenFile *f = &open_files[fd];
         unsigned int pos = cluster_off * fat32_cluster_size + sector_off * fat32_bytes_per_sector;
         f->position = pos;
-        f->cur_cluster = f->first_cluster;
-        f->cur_cluster_index = 0;
+        unsigned int target_ci = pos / fat32_cluster_size;
+        chain_ckpt_seek_back(f, target_ci);
         return 0;
     }
 
