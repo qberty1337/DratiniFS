@@ -232,6 +232,7 @@ static unsigned int fat32_total_sectors;   // this comes from bpb
 static unsigned int fat32_total_clusters;
 static unsigned int fat32_free_clusters;   // cached free cluster count (IMPORTANT! computed at init!!)
 static unsigned int fat32_fsinfo_sector;   // BPB fs_info field — sector holding FSInfo struct
+static unsigned int fat32_volume_serial;   // BS_VolID from boot sector (FAT32 offset 67, exFAT offset 100)
 static unsigned int fat32_next_free_hint = 2;
 static unsigned int exfat_free_clusters;
 
@@ -4709,10 +4710,10 @@ static int exfat_IoDevctl(PspIoDrvFileArg *arg, const char *devname,
             *(int *)outdata = fat32_sectors_per_cluster;
         return 0;
 
-    // get the serial number (when sony uses this it's usually a dummy)
+    // get the serial number (read from BPB at mount)
     case 0x02415862:
         if (outdata && outlen >= 4)
-            *(unsigned int *)outdata = 0x12345678; // feed dummy serial for now
+            *(unsigned int *)outdata = fat32_volume_serial;
         return 0;
 
     // get the fs typee
@@ -5264,6 +5265,8 @@ static int __attribute__((noinline)) fat32_init(void)
     fat_cached_sector = 0xFFFFFFFF;
     fat_big_cache_invalidate_all();
 
+    memcpy(&fat32_volume_serial, bpb_buf + 67, 4);
+
     // read fsinfo for free cluster count (sony's is instant, no fat scan)
     fat32_free_clusters = 0;
     fat32_fsinfo_sector = 0;
@@ -5313,6 +5316,7 @@ static int __attribute__((used)) exfat_init(void)
     exfat_root_cluster        = *(unsigned int *)(vbr + 96);
     exfat_cluster_count       = *(unsigned int *)(vbr + 92);
     exfat_volume_sectors      = *(unsigned int *)(vbr + 72);
+    memcpy(&fat32_volume_serial, vbr + 100, 4);
     exfat_fat_cached_sector = 0xFFFFFFFF;
     fat_big_cache_invalidate_all();
 
