@@ -231,6 +231,7 @@ static unsigned int fat32_root_cluster;
 static unsigned int fat32_total_sectors;   // this comes from bpb
 static unsigned int fat32_total_clusters;
 static unsigned int fat32_free_clusters;   // cached free cluster count (IMPORTANT! computed at init!!)
+static unsigned int fat32_fsinfo_sector;   // BPB fs_info field — sector holding FSInfo struct
 static unsigned int fat32_next_free_hint = 2;
 static unsigned int exfat_free_clusters;
 
@@ -567,10 +568,42 @@ static unsigned char blk_bounce_buf[512] __attribute__((aligned(64)));
 
 // !NOTE: directory sector read cache. sony's driver caches this at a higher layer
 // without caching, gclite's per-entry dread loop turns into constant block reads. I need to
-// do this as gclite does some weird writing when selecting categories. every cat select is an i/o write :/
-static unsigned int dir_rd_cache_sec = 0xFFFFFFFF;
-static unsigned char dir_rd_cache_buf[512] __attribute__((aligned(64)));
-static inline void dir_rd_cache_invalidate(void) { dir_rd_cache_sec = 0xFFFFFFFF; }
+// 4-slot LRU directory sector cache (matches sony's 4-slot design).
+// gclite does some weird writing when selecting categories so invalidate on IoDopen.
+#define DIR_RD_CACHE_SLOTS 4
+static unsigned int  dir_rd_cache_sec[DIR_RD_CACHE_SLOTS];
+static unsigned char dir_rd_cache_buf[DIR_RD_CACHE_SLOTS][512] __attribute__((aligned(64)));
+static unsigned int  dir_rd_cache_lru[DIR_RD_CACHE_SLOTS];
+static unsigned int  dir_rd_cache_age;
+
+static void dir_rd_cache_invalidate(void) {
+    int i;
+    for (i = 0; i < DIR_RD_CACHE_SLOTS; i++)
+        dir_rd_cache_sec[i] = 0xFFFFFFFF;
+    dir_rd_cache_age = 0;
+}
+
+static unsigned char *dir_rd_cache_get(unsigned int sec) {
+    int i, min_i = 0;
+    unsigned int min_lru = dir_rd_cache_lru[0];
+    for (i = 0; i < DIR_RD_CACHE_SLOTS; i++) {
+        if (dir_rd_cache_sec[i] == sec) {
+            dir_rd_cache_lru[i] = ++dir_rd_cache_age;
+            return dir_rd_cache_buf[i];
+        }
+        if (dir_rd_cache_lru[i] < min_lru) {
+            min_lru = dir_rd_cache_lru[i];
+            min_i = i;
+        }
+    }
+    int ret = g_use_exfat
+        ? exfat_blk_read_sectors(sec, dir_rd_cache_buf[min_i], 1)
+        : blk_read_sectors(sec, dir_rd_cache_buf[min_i], 1);
+    if (ret < 0) { dir_rd_cache_invalidate(); return NULL; }
+    dir_rd_cache_sec[min_i] = sec;
+    dir_rd_cache_lru[min_i] = ++dir_rd_cache_age;
+    return dir_rd_cache_buf[min_i];
+}
 
 
 static void blk_wr_cache_push(unsigned int sector, const void *data)
@@ -3304,7 +3337,6 @@ static int exfat_IoDread(PspIoDrvFileArg *arg, SceIoDirent *dir)
         // exfat directory enumeration parses 0x85→0xc0→0xc1 entry sets
         // standard filesystem jazz. uses the shared dir read cache to avoid
         // re-reading the same sector for consecutive 32-byte entries.
-        unsigned char *drd_sec_buf = dir_rd_cache_buf;
         while (1) {
             if (f->dir_offset >= exfat_cluster_size) {
                 if (f->no_fat_chain)
@@ -3320,11 +3352,8 @@ static int exfat_IoDread(PspIoDrvFileArg *arg, SceIoDirent *dir)
                 (f->dir_offset / exfat_bytes_per_sector);
             unsigned int sec_off = f->dir_offset % exfat_bytes_per_sector;
 
-            if (sec != dir_rd_cache_sec) {
-                int ret = exfat_blk_read_sectors(sec, drd_sec_buf, 1);
-                if (ret < 0) { dir_rd_cache_invalidate(); return 0; }
-                dir_rd_cache_sec = sec;
-            }
+            unsigned char *drd_sec_buf = dir_rd_cache_get(sec);
+            if (!drd_sec_buf) return 0;
 
             unsigned char etype = drd_sec_buf[sec_off];
             f->dir_offset += 32;
@@ -3358,11 +3387,8 @@ static int exfat_IoDread(PspIoDrvFileArg *arg, SceIoDirent *dir)
                     (f->dir_offset / exfat_bytes_per_sector);
                 sec_off = f->dir_offset % exfat_bytes_per_sector;
 
-                if (sec != dir_rd_cache_sec) {
-                    int ret2 = exfat_blk_read_sectors(sec, drd_sec_buf, 1);
-                    if (ret2 < 0) { dir_rd_cache_invalidate(); break; }
-                    dir_rd_cache_sec = sec;
-                }
+                drd_sec_buf = dir_rd_cache_get(sec);
+                if (!drd_sec_buf) break;
 
                 unsigned char st = drd_sec_buf[sec_off];
                 if (st == EXFAT_ENTRY_STREAM) {
@@ -3430,7 +3456,6 @@ static int exfat_IoDread(PspIoDrvFileArg *arg, SceIoDirent *dir)
     }
 
     // fat32 directory enum also uses the shared dir read cache
-    unsigned char *drd_sec_buf = dir_rd_cache_buf;
     unsigned short ucs2_buf[256]; // use the raw ucs-2 lfn for codepage conversion
     int ucs2_ready = 0;
     while (1) {
@@ -3444,11 +3469,8 @@ static int exfat_IoDread(PspIoDrvFileArg *arg, SceIoDirent *dir)
         unsigned int sec = cluster_to_sector(f->dir_cluster) + (f->dir_offset / fat32_bytes_per_sector);
         unsigned int sec_off = f->dir_offset % fat32_bytes_per_sector;
 
-        if (sec != dir_rd_cache_sec) {
-            int ret = blk_read_sectors(sec, drd_sec_buf, 1);
-            if (ret < 0) { dir_rd_cache_invalidate(); return 0; }
-            dir_rd_cache_sec = sec;
-        }
+        unsigned char *drd_sec_buf = dir_rd_cache_get(sec);
+        if (!drd_sec_buf) return 0;
 
         FatDirEntry *entry = (FatDirEntry *)(drd_sec_buf + sec_off);
         f->dir_offset += 32;
@@ -4055,6 +4077,21 @@ static int exfat_IoUmount(PspIoDrvFileArg *arg, const char *devname)
                     fat2_flush();
                 }
                 open_files[i].in_use = 0;
+            }
+        }
+    }
+
+    // write back FSInfo with current free cluster count (FAT32 only)
+    if (!g_use_exfat && fat32_fsinfo_sector != 0 && blk_fd >= 0) {
+        unsigned char fsi[512] __attribute__((aligned(64)));
+        if (blk_read_sectors(fat32_fsinfo_sector, fsi, 1) >= 0) {
+            unsigned int sig1, sig2;
+            memcpy(&sig1, fsi + 0, 4);
+            memcpy(&sig2, fsi + 484, 4);
+            if (sig1 == 0x41615252 && sig2 == 0x61417272) {
+                memcpy(fsi + 488, &fat32_free_clusters, 4);
+                memcpy(fsi + 492, &fat32_next_free_hint, 4);
+                blk_write_sectors(fat32_fsinfo_sector, fsi, 1);
             }
         }
     }
@@ -5229,7 +5266,9 @@ static int __attribute__((noinline)) fat32_init(void)
 
     // read fsinfo for free cluster count (sony's is instant, no fat scan)
     fat32_free_clusters = 0;
+    fat32_fsinfo_sector = 0;
     if (bpb->fs_info >= 1 && bpb->fs_info < bpb->reserved_sectors) {
+        fat32_fsinfo_sector = bpb->fs_info;
         unsigned char fsi_buf[512] __attribute__((aligned(64)));
         if (blk_read_sectors(bpb->fs_info, fsi_buf, 1) >= 0) {
             unsigned int sig1, sig2, free_count;
