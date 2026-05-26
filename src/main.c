@@ -1192,6 +1192,19 @@ static unsigned short exfat_name_hash(const char *name, int nlen)
     return hash;
 }
 
+static unsigned short exfat_name_hash_ucs2(const unsigned short *name, int nlen)
+{
+    unsigned short hash = 0;
+    int i;
+    for (i = 0; i < nlen; i++) {
+        unsigned short ch = name[i];
+        if (ch >= 'a' && ch <= 'z') ch -= 32;
+        hash = ((hash << 15) | (hash >> 1)) + (ch & 0xFF);
+        hash = ((hash << 15) | (hash >> 1)) + (ch >> 8);
+    }
+    return hash;
+}
+
 // compute entrysetchecksum
 static unsigned short exfat_entry_checksum(const unsigned char *es, int size)
 {
@@ -1471,6 +1484,18 @@ static int strcasecmp_local(const char *a, const char *b)
     return (unsigned char)*a - (unsigned char)*b;
 }
 
+static int strcasecmp_ucs2(const unsigned short *a, const unsigned short *b)
+{
+    while (*a && *b) {
+        unsigned short ca = *a, cb = *b;
+        if (ca >= 'a' && ca <= 'z') ca -= 32;
+        if (cb >= 'a' && cb <= 'z') cb -= 32;
+        if (ca != cb) return (int)ca - (int)cb;
+        a++; b++;
+    }
+    return (int)*a - (int)*b;
+}
+
 static void fat_extract_shortname(const FatDirEntry *entry, char *out)
 {
     int i, j = 0;
@@ -1544,13 +1569,18 @@ static unsigned int fat32_find_in_dir_ex(unsigned int dir_cluster, const char *n
 {
     unsigned char sfn[11];
     int use_sfn = to_fat83(name, sfn);
-    char lfn_buf[256];
+    unsigned short lfn_ucs2[256];
     int lfn_ready = 0;
     unsigned char dir_sec_buf[512] __attribute__((aligned(64)));
 
+    // convert search name to ucs-2 for proper LFN comparison (supports JP/CN/KR codepages)
+    unsigned short name_ucs2[260];
+    memset(name_ucs2, 0, sizeof(name_ucs2));
+    sceCodepage_driver_C899572E(name_ucs2, 260, name);
+
     unsigned int cluster = dir_cluster;
     unsigned int iter32 = 0;
-    memset(lfn_buf, 0, sizeof(lfn_buf));
+    memset(lfn_ucs2, 0, sizeof(lfn_ucs2));
 
     while (cluster >= 2 && cluster < FAT32_EOC && iter32 < fat32_total_clusters) {
         iter32++;
@@ -1572,7 +1602,7 @@ static unsigned int fat32_find_in_dir_ex(unsigned int dir_cluster, const char *n
                     return 0;
 
                 if (entry->name[0] == 0xE5) {
-                    memset(lfn_buf, 0, sizeof(lfn_buf));
+                    memset(lfn_ucs2, 0, sizeof(lfn_ucs2));
                     lfn_ready = 0;
                     continue;
                 }
@@ -1581,8 +1611,8 @@ static unsigned int fat32_find_in_dir_ex(unsigned int dir_cluster, const char *n
                     FatLfnEntry *lfn = (FatLfnEntry *)entry;
                     int seq = lfn->order & 0x3F;
                     if (lfn->order & 0x40)
-                        memset(lfn_buf, 0, sizeof(lfn_buf));
-                    fat_extract_lfn_part(lfn, lfn_buf, seq);
+                        memset(lfn_ucs2, 0, sizeof(lfn_ucs2));
+                    fat_extract_lfn_part_ucs2(lfn, lfn_ucs2, seq);
                     if (seq == 1)
                         lfn_ready = 1;
                     continue;
@@ -1595,8 +1625,8 @@ static unsigned int fat32_find_in_dir_ex(unsigned int dir_cluster, const char *n
 
                 int matched = 0;
 
-                if (lfn_ready && lfn_buf[0]) {
-                    if (strcasecmp_local(name, lfn_buf) == 0)
+                if (lfn_ready && lfn_ucs2[0]) {
+                    if (strcasecmp_ucs2(name_ucs2, lfn_ucs2) == 0)
                         matched = 1;
                 }
 
@@ -1621,7 +1651,7 @@ static unsigned int fat32_find_in_dir_ex(unsigned int dir_cluster, const char *n
                     return cl;
                 }
 
-                memset(lfn_buf, 0, sizeof(lfn_buf));
+                memset(lfn_ucs2, 0, sizeof(lfn_ucs2));
                 lfn_ready = 0;
             }
         }
@@ -2148,10 +2178,13 @@ static unsigned int exfat_find_in_dir(unsigned int dir_cluster,
     unsigned char buf[512] __attribute__((aligned(64)));
     unsigned int iter = 0;
 
-    // precompute namehash so we can skip the full name collect + ascii compare on streamentry mismatch
+    // convert search name to ucs-2 for proper comparison (supports JP/CN/KR)
+    unsigned short name_ucs2[260];
+    memset(name_ucs2, 0, sizeof(name_ucs2));
+    sceCodepage_driver_C899572E(name_ucs2, 260, name);
     int name_len = 0;
-    while (name[name_len]) name_len++;
-    unsigned short search_hash = exfat_name_hash(name, name_len);
+    while (name_ucs2[name_len]) name_len++;
+    unsigned short search_hash = exfat_name_hash_ucs2(name_ucs2, name_len);
 
     while (cluster >= 2 && cluster < FAT32_EOC && iter < exfat_cluster_count) {
         iter++;
@@ -2176,12 +2209,13 @@ static unsigned int exfat_find_in_dir(unsigned int dir_cluster,
                 unsigned int first_cl = 0;
                 unsigned int fsize = 0;
                 int no_chain = 0;
-                char collected_name[256];
+                unsigned short collected_ucs2[256];
                 int name_pos = 0;
                 int subs_read = 0;
                 unsigned int captured_stream_sec = 0;
                 unsigned int captured_stream_off = 0;
                 int name_hash_mismatch = 0;
+                memset(collected_ucs2, 0, sizeof(collected_ucs2));
 
                 // ok,advance to next entry
                 unsigned int eoff = off + 32;
@@ -2225,28 +2259,18 @@ static unsigned int exfat_find_in_dir(unsigned int dir_cluster,
                         for (k = 0; k < 15 && name_pos < 255; k++) {
                             unsigned short ch = ne->name[k];
                             if (ch == 0) break;
-                            collected_name[name_pos++] = (ch < 128) ? (char)ch : '?';
+                            collected_ucs2[name_pos++] = ch;
                         }
                     }
                     subs_read++;
                     eoff += 32;
                 }
 
-                collected_name[name_pos] = '\0';
+                collected_ucs2[name_pos] = 0;
 
                 int match = 0;
                 if (!name_hash_mismatch) {
-                    const char *a = name;
-                    const char *b = collected_name;
-                    match = 1;
-                    while (*a && *b) {
-                        char ca = *a, cb = *b;
-                        if (ca >= 'a' && ca <= 'z') ca -= 32;
-                        if (cb >= 'a' && cb <= 'z') cb -= 32;
-                        if (ca != cb) { match = 0; break; }
-                        a++; b++;
-                    }
-                    if (*a || *b) match = 0;
+                    match = (strcasecmp_ucs2(name_ucs2, collected_ucs2) == 0) ? 1 : 0;
                 }
 
                 if (match && first_cl >= 2) {
