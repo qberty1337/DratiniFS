@@ -554,6 +554,15 @@ static inline void chain_ckpt_seek_back(OpenFile *f, unsigned int target_idx)
 
 static OpenFile open_files[MAX_OPEN_FILES];
 
+// check if any fd is currently open for this cluster (delete protection)
+static int file_is_open(unsigned int cluster) {
+    int i;
+    for (i = 0; i < MAX_OPEN_FILES; i++)
+        if (open_files[i].in_use && open_files[i].first_cluster == cluster)
+            return 1;
+    return 0;
+}
+
 static void __attribute__((unused)) fat32_update_dir_size(unsigned int dir_cluster, unsigned int file_cluster,
                                    unsigned int new_size);
 
@@ -2902,6 +2911,7 @@ static int exfat_IoRemove(PspIoDrvFileArg *arg, const char *name)
             return 0x80010002;
         }
         if (at & 0x10) return 0x80010014;
+        if (file_is_open(cl)) return 0x8001000D;
         const char *b = name; while (*b == '/') b++;
         const char *l = NULL; const char *p = b;
         while (*p) { if (*p == '/') l = p; p++; }
@@ -2939,7 +2949,8 @@ static int exfat_IoRemove(PspIoDrvFileArg *arg, const char *name)
         return 0x80010002;
     }
     // sony checks attr & 0x19 = readonly|volume_id|directory
-    if (attr & 0x19) return 0x8001000D; // eacces right?
+    if (attr & 0x19) return 0x8001000D;
+    if (file_is_open(cluster)) return 0x8001000D;
 
     const char *base = name;
     while (*base == '/') base++;
@@ -3119,6 +3130,7 @@ static int exfat_IoRmdir(PspIoDrvFileArg *arg, const char *name)
         unsigned int cl = exfat_resolve_path(name, &sz, &at, &nc);
         if (cl == 0) return 0x80010002;
         if (!(at & 0x10)) return 0x80010014;
+        if (file_is_open(cl)) return 0x8001000D;
         {
             unsigned char chk[512] __attribute__((aligned(64)));
             unsigned int ccl = cl;
@@ -3167,6 +3179,7 @@ static int exfat_IoRmdir(PspIoDrvFileArg *arg, const char *name)
     unsigned int cluster = fat32_resolve_path(name, &size, &attr);
     if (cluster == 0) return 0x80010002;
     if (!(attr & FAT_ATTR_DIRECTORY)) return 0x80010014;
+    if (file_is_open(cluster)) return 0x8001000D;
 
     // check directory is empty (only . and .. allowed)
     {
