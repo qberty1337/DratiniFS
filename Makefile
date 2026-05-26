@@ -24,6 +24,12 @@ LIBS = -nostdlib -lpspdebug -lpspctrl_driver -lpspmodinfo -lpspsdk -lgcc
 PSPSDK = $(shell psp-config --pspsdk-path)
 include $(PSPSDK)/lib/build_prx.mak
 
-# deploy as plain PRX to flash0:/kd/fatms.prx.
-all: $(TARGET).prx
-	cp $(TARGET).prx fatms.prx
+# fatms.prx = compressed (deploy to flash0:/kd/)
+# fatms_uncompressed.prx = raw build
+all: $(TARGET).prx fatms.prx
+
+fatms.prx: $(TARGET).prx pspgz.py SystemControl.hdr
+	cp $(TARGET).prx fatms_uncompressed.prx
+	python3 pspgz.py fatms.prx SystemControl.hdr fatms_uncompressed.prx sceMSFAT_Driver 0x1007
+	@echo "  Uncompressed: $$(stat -c%s fatms_uncompressed.prx) bytes"
+	@echo "  Compressed:   $$(stat -c%s fatms.prx) bytes"
