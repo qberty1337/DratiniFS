@@ -50,7 +50,3 @@ IMPORT_FUNC "SysclibForKernel", 0xAB7592FF, memcpy
 IMPORT_FUNC "SysclibForKernel", 0x81D0D1F7, memcmp
 IMPORT_FUNC "SysclibForKernel", 0x52DF196C, strlen
 
-IMPORT_START "SysMemForKernel", 0x00090000
-IMPORT_FUNC "SysMemForKernel", 0x237DBD4F, sceKernelAllocPartitionMemory
-IMPORT_FUNC "SysMemForKernel", 0xB6D61D02, sceKernelFreePartitionMemory
-IMPORT_FUNC "SysMemForKernel", 0x9D9A5BA1, sceKernelGetBlockHeadAddr

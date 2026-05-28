@@ -18,9 +18,6 @@ extern void sceKernelDcacheWritebackInvalidateRange(const void *addr, unsigned i
 extern void sceKernelIcacheInvalidateAll(void);
 extern void sceKernelIcacheInvalidateRange(const void *addr, unsigned int size);
 
-extern SceUID sceKernelAllocPartitionMemory(SceUID partition, const char *name, int type, SceSize size, void *addr);
-extern int    sceKernelFreePartitionMemory(SceUID blockid);
-extern void  *sceKernelGetBlockHeadAddr(SceUID blockid);
 
 // use mutex to match sony's fatms behavior (switch from semaphore during POC)
 // no measurable performance difference (only theoretical)
@@ -238,109 +235,6 @@ static unsigned int exfat_free_clusters;
 static unsigned char fat_sector_buf[512] __attribute__((aligned(64)));
 static unsigned int fat_cached_sector = 0xFFFFFFFF;
 
-#define FAT_BIG_CACHE_MAX_SECTORS      4096u
-#define FAT_BIG_CACHE_BITMAP_BYTES     (FAT_BIG_CACHE_MAX_SECTORS / 8u)
-#define FAT_BIG_CACHE_PREFETCH_SECTORS 16u
-
-static SceUID         fat_big_cache_blockid = -1;
-static unsigned char *fat_big_cache_buf = NULL;
-static unsigned int   fat_big_cache_size_sectors = 0;
-static unsigned int   fat_big_cache_base_sector  = 0xFFFFFFFFu;
-static unsigned char  fat_big_cache_loaded[FAT_BIG_CACHE_BITMAP_BYTES];
-
-static inline int fat_big_cache_try_hit(unsigned int fat_sector, void *dst)
-{
-    if (!fat_big_cache_buf || fat_big_cache_size_sectors == 0) return 0;
-    if (fat_sector < fat_big_cache_base_sector) return 0;
-    unsigned int idx = fat_sector - fat_big_cache_base_sector;
-    if (idx >= fat_big_cache_size_sectors) return 0;
-    if (!(fat_big_cache_loaded[idx >> 3] & (1u << (idx & 7u)))) return 0;
-    memcpy(dst, fat_big_cache_buf + (unsigned int)idx * 512u, 512);
-    return 1;
-}
-
-static inline void fat_big_cache_store(unsigned int fat_sector, const void *src)
-{
-    if (!fat_big_cache_buf || fat_big_cache_size_sectors == 0) return;
-    if (fat_sector < fat_big_cache_base_sector) return;
-    unsigned int idx = fat_sector - fat_big_cache_base_sector;
-    if (idx >= fat_big_cache_size_sectors) return;
-    memcpy(fat_big_cache_buf + (unsigned int)idx * 512u, src, 512);
-    fat_big_cache_loaded[idx >> 3] |= (1u << (idx & 7u));
-}
-
-// slide window if needed + bulk-prefetch up to FAT_BIG_CACHE_PREFETCH_SECTORS at target.
-// returns 1 if target sector now loaded, 0 on failure.
-static int fat_big_cache_prefetch(unsigned int target_sector)
-{
-    if (!fat_big_cache_buf || fat_big_cache_size_sectors == 0) return 0;
-    // slide window to start at target if target is outside current window
-    if (target_sector < fat_big_cache_base_sector
-        || (target_sector - fat_big_cache_base_sector) >= fat_big_cache_size_sectors) {
-        fat_big_cache_base_sector = target_sector;
-        memset(fat_big_cache_loaded, 0, sizeof(fat_big_cache_loaded));
-    }
-    unsigned int idx = target_sector - fat_big_cache_base_sector;
-    unsigned int prefetch = FAT_BIG_CACHE_PREFETCH_SECTORS;
-    unsigned int remaining = fat_big_cache_size_sectors - idx;
-    if (prefetch > remaining) prefetch = remaining;
-    int ret = g_use_exfat
-        ? exfat_blk_read_sectors(target_sector,
-                                  fat_big_cache_buf + (unsigned int)idx * 512u, prefetch)
-        : blk_read_sectors(target_sector,
-                           fat_big_cache_buf + (unsigned int)idx * 512u, prefetch);
-    if (ret <= 0) return 0;
-    unsigned int filled = (unsigned int)ret / 512u;
-    if (filled == 0) return 0;
-    if (filled > prefetch) filled = prefetch;
-    unsigned int i;
-    for (i = 0; i < filled; i++) {
-        unsigned int slot = idx + i;
-        fat_big_cache_loaded[slot >> 3] |= (1u << (slot & 7u));
-    }
-    return 1;
-}
-
-static void fat_big_cache_invalidate_all(void)
-{
-    memset(fat_big_cache_loaded, 0, sizeof(fat_big_cache_loaded));
-    fat_big_cache_base_sector = 0xFFFFFFFFu;
-}
-
-static void fat_big_cache_free(void)
-{
-    if (fat_big_cache_blockid >= 0) {
-        sceKernelFreePartitionMemory(fat_big_cache_blockid);
-        fat_big_cache_blockid = -1;
-    }
-    fat_big_cache_buf = NULL;
-    fat_big_cache_size_sectors = 0;
-    fat_big_cache_base_sector = 0xFFFFFFFFu;
-    memset(fat_big_cache_loaded, 0, sizeof(fat_big_cache_loaded));
-}
-
-// (re)allocate to fit min(fat32_fat_size, 4096), safe to call on every mount
-// reuses existing block if size hasn't changed
-static void fat_big_cache_alloc(void)
-{
-    if (fat32_fat_size == 0) { fat_big_cache_free(); return; }
-    unsigned int want = fat32_fat_size;
-    if (want > FAT_BIG_CACHE_MAX_SECTORS) want = FAT_BIG_CACHE_MAX_SECTORS;
-    if (fat_big_cache_buf && fat_big_cache_size_sectors == want) {
-        fat_big_cache_invalidate_all();
-        return;
-    }
-    fat_big_cache_free();
-    SceUID id = sceKernelAllocPartitionMemory(1, "FatmsFatCache", 1,
-                                              want * 512u, NULL);
-    if (id < 0) return;
-    void *p = sceKernelGetBlockHeadAddr(id);
-    if (!p) { sceKernelFreePartitionMemory(id); return; }
-    fat_big_cache_blockid = id;
-    fat_big_cache_buf = (unsigned char *)p;
-    fat_big_cache_size_sectors = want;
-    fat_big_cache_base_sector = 0xFFFFFFFFu;
-}
 
 // use sony's 661 fatms mount state
 // 0x1022 = unmounted (no card or card rejected)
@@ -442,7 +336,6 @@ static int fatms_sysevent_handler(int ev_id, char *ev_name, void *param, int *re
         blk_fd_validated = 0;
         fat_cached_sector = 0xFFFFFFFF;
         exfat_fat_cached_sector = 0xFFFFFFFF;
-        fat_big_cache_invalidate_all();
         blk_wr_cache_invalidate_all();
         break;
     case 0x00010000:
@@ -663,15 +556,8 @@ static unsigned int fat32_next_cluster(unsigned int cluster)
     unsigned int entry_offset = fat_offset % fat32_bytes_per_sector;
 
     if (fat_sector != fat_cached_sector) {
-        if (!fat_big_cache_try_hit(fat_sector, fat_sector_buf)) {
-            if (fat_big_cache_prefetch(fat_sector)) {
-                fat_big_cache_try_hit(fat_sector, fat_sector_buf);
-            } else {
-                int ret = blk_read_sectors(fat_sector, fat_sector_buf, 1);
-                if (ret < 0)
-                    return FAT32_EOC;
-            }
-        }
+        int ret = blk_read_sectors(fat_sector, fat_sector_buf, 1);
+        if (ret < 0) return FAT32_EOC;
         fat_cached_sector = fat_sector;
     }
 
@@ -739,15 +625,8 @@ static unsigned int __attribute__((unused)) exfat_next_cluster(unsigned int clus
     unsigned int entry_offset = fat_offset % exfat_bytes_per_sector;
 
     if (fat_sector != exfat_fat_cached_sector) {
-        if (!fat_big_cache_try_hit(fat_sector, exfat_fat_sector_buf)) {
-            if (fat_big_cache_prefetch(fat_sector)) {
-                fat_big_cache_try_hit(fat_sector, exfat_fat_sector_buf);
-            } else {
-                int ret = exfat_blk_read_sectors(fat_sector, exfat_fat_sector_buf, 1);
-                if (ret < 0)
-                    return FAT32_EOC;
-            }
-        }
+        int ret = exfat_blk_read_sectors(fat_sector, exfat_fat_sector_buf, 1);
+        if (ret < 0) return FAT32_EOC;
         exfat_fat_cached_sector = fat_sector;
     }
 
@@ -804,19 +683,12 @@ static int exfat_write_fat_entry(unsigned int cluster, unsigned int value)
     unsigned int entry_offset = fat_offset % exfat_bytes_per_sector;
 
     if (fat_sector != exfat_fat_cached_sector) {
-        if (!fat_big_cache_try_hit(fat_sector, exfat_fat_sector_buf)) {
-            if (fat_big_cache_prefetch(fat_sector)) {
-                fat_big_cache_try_hit(fat_sector, exfat_fat_sector_buf);
-            } else {
-                if (exfat_blk_read_sectors(fat_sector, exfat_fat_sector_buf, 1) < 0)
-                    return -1;
-            }
-        }
+        if (exfat_blk_read_sectors(fat_sector, exfat_fat_sector_buf, 1) < 0)
+            return -1;
         exfat_fat_cached_sector = fat_sector;
     }
     memcpy(exfat_fat_sector_buf + entry_offset, &value, 4);
     int wr = exfat_blk_write_sectors(fat_sector, exfat_fat_sector_buf, 1);
-    if (wr >= 0) fat_big_cache_store(fat_sector, exfat_fat_sector_buf);
     return wr;
 }
 
@@ -1668,14 +1540,8 @@ static int fat32_write_fat(unsigned int cluster, unsigned int value)
     }
 
     if (fat_sector != fat_cached_sector) {
-        if (!fat_big_cache_try_hit(fat_sector, fat_sector_buf)) {
-            if (fat_big_cache_prefetch(fat_sector)) {
-                fat_big_cache_try_hit(fat_sector, fat_sector_buf);
-            } else {
-                int ret = blk_read_sectors(fat_sector, fat_sector_buf, 1);
-                if (ret < 0) return ret;
-            }
-        }
+        int ret = blk_read_sectors(fat_sector, fat_sector_buf, 1);
+        if (ret < 0) return ret;
         fat_cached_sector = fat_sector;
     }
     unsigned int old_raw = *(unsigned int *)(fat_sector_buf + entry_offset);
@@ -1690,7 +1556,6 @@ static int fat32_write_fat(unsigned int cluster, unsigned int value)
     int ret = blk_write_sectors(fat_sector, fat_sector_buf, 1);
     if (ret < 0) return ret;
     blk_wr_cache_push(fat_sector, fat_sector_buf);
-    fat_big_cache_store(fat_sector, fat_sector_buf);
 
     // mark fat2 as needing sync - will be flushed when sector changes or at fat2_flush()
     fat2_dirty_sector = fat_sector;
@@ -4234,7 +4099,6 @@ static int exfat_IoDevctl(PspIoDrvFileArg *arg, const char *devname,
         blk_fd_validated = 0;
         fat_cached_sector = 0xFFFFFFFF;
         exfat_fat_cached_sector = 0xFFFFFFFF;
-        fat_big_cache_invalidate_all();
         blk_wr_cache_invalidate_all();
         dir_rd_cache_invalidate();
         // force the full reinit on the next vfs call
@@ -4627,7 +4491,6 @@ static int exfat_IoDevctl(PspIoDrvFileArg *arg, const char *devname,
         // the xmb waits for the callback and it does not self rescan
         // without the callback, xmb shows "Format Failed." (sometimes it would skip to Memory Stick Not Inserted?? how is that possible... probably an anomaly)
         fat_cached_sector = 0xFFFFFFFF;
-        fat_big_cache_invalidate_all();
         if (blk_fd >= 0) {
             k_sceIoClose(blk_fd);
             blk_fd = -1; blk_fd_pos = 0xFFFFFFFFFFFFFFFFULL;
@@ -5227,7 +5090,6 @@ static int __attribute__((noinline)) fat32_init(void)
     fat32_total_clusters = (fat32_total_sectors - fat32_data_start_sector) / fat32_sectors_per_cluster;
 
     fat_cached_sector = 0xFFFFFFFF;
-    fat_big_cache_invalidate_all();
 
     // read fsinfo for free cluster count (sony's is instant, no fat scan)
     fat32_free_clusters = 0;
@@ -5277,7 +5139,6 @@ static int __attribute__((used)) exfat_init(void)
     exfat_cluster_count       = *(unsigned int *)(vbr + 92);
     exfat_volume_sectors      = *(unsigned int *)(vbr + 72);
     exfat_fat_cached_sector = 0xFFFFFFFF;
-    fat_big_cache_invalidate_all();
 
     // scan root directory for allocation bitmap entry
     {
@@ -5612,7 +5473,6 @@ static void do_mount_work_inner(void)
         // fat32_free_clusters already set by fat32_init via fsinfo
     }
 
-    fat_big_cache_alloc();
 
     // let's now assign the ms0!
     int assigned = 0;
