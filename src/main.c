@@ -16,6 +16,7 @@ extern SceModule *sceKernelFindModuleByName(const char *name);
 // cache the flush stubs for binary-patching msstor's sub_03334 in place
 extern void sceKernelDcacheWritebackInvalidateRange(const void *addr, unsigned int size);
 extern void sceKernelIcacheInvalidateAll(void);
+extern void sceKernelIcacheInvalidateRange(const void *addr, unsigned int size);
 
 extern SceUID sceKernelAllocPartitionMemory(SceUID partition, const char *name, int type, SceSize size, void *addr);
 extern int    sceKernelFreePartitionMemory(SceUID blockid);
@@ -231,8 +232,6 @@ static unsigned int fat32_root_cluster;
 static unsigned int fat32_total_sectors;   // this comes from bpb
 static unsigned int fat32_total_clusters;
 static unsigned int fat32_free_clusters;   // cached free cluster count (IMPORTANT! computed at init!!)
-static unsigned int fat32_fsinfo_sector;   // BPB fs_info field — sector holding FSInfo struct
-static unsigned int fat32_volume_serial;   // BS_VolID from boot sector (FAT32 offset 67, exFAT offset 100)
 static unsigned int fat32_next_free_hint = 2;
 static unsigned int exfat_free_clusters;
 
@@ -554,15 +553,6 @@ static inline void chain_ckpt_seek_back(OpenFile *f, unsigned int target_idx)
 
 static OpenFile open_files[MAX_OPEN_FILES];
 
-// check if any fd is currently open for this cluster (delete protection)
-static int file_is_open(unsigned int cluster) {
-    int i;
-    for (i = 0; i < MAX_OPEN_FILES; i++)
-        if (open_files[i].in_use && open_files[i].first_cluster == cluster)
-            return 1;
-    return 0;
-}
-
 static void __attribute__((unused)) fat32_update_dir_size(unsigned int dir_cluster, unsigned int file_cluster,
                                    unsigned int new_size);
 
@@ -578,42 +568,10 @@ static unsigned char blk_bounce_buf[512] __attribute__((aligned(64)));
 
 // !NOTE: directory sector read cache. sony's driver caches this at a higher layer
 // without caching, gclite's per-entry dread loop turns into constant block reads. I need to
-// 4-slot LRU directory sector cache (matches sony's 4-slot design).
-// gclite does some weird writing when selecting categories so invalidate on IoDopen.
-#define DIR_RD_CACHE_SLOTS 4
-static unsigned int  dir_rd_cache_sec[DIR_RD_CACHE_SLOTS];
-static unsigned char dir_rd_cache_buf[DIR_RD_CACHE_SLOTS][512] __attribute__((aligned(64)));
-static unsigned int  dir_rd_cache_lru[DIR_RD_CACHE_SLOTS];
-static unsigned int  dir_rd_cache_age;
-
-static void dir_rd_cache_invalidate(void) {
-    int i;
-    for (i = 0; i < DIR_RD_CACHE_SLOTS; i++)
-        dir_rd_cache_sec[i] = 0xFFFFFFFF;
-    dir_rd_cache_age = 0;
-}
-
-static unsigned char *dir_rd_cache_get(unsigned int sec) {
-    int i, min_i = 0;
-    unsigned int min_lru = dir_rd_cache_lru[0];
-    for (i = 0; i < DIR_RD_CACHE_SLOTS; i++) {
-        if (dir_rd_cache_sec[i] == sec) {
-            dir_rd_cache_lru[i] = ++dir_rd_cache_age;
-            return dir_rd_cache_buf[i];
-        }
-        if (dir_rd_cache_lru[i] < min_lru) {
-            min_lru = dir_rd_cache_lru[i];
-            min_i = i;
-        }
-    }
-    int ret = g_use_exfat
-        ? exfat_blk_read_sectors(sec, dir_rd_cache_buf[min_i], 1)
-        : blk_read_sectors(sec, dir_rd_cache_buf[min_i], 1);
-    if (ret < 0) { dir_rd_cache_invalidate(); return NULL; }
-    dir_rd_cache_sec[min_i] = sec;
-    dir_rd_cache_lru[min_i] = ++dir_rd_cache_age;
-    return dir_rd_cache_buf[min_i];
-}
+// do this as gclite does some weird writing when selecting categories. every cat select is an i/o write :/
+static unsigned int dir_rd_cache_sec = 0xFFFFFFFF;
+static unsigned char dir_rd_cache_buf[512] __attribute__((aligned(64)));
+static inline void dir_rd_cache_invalidate(void) { dir_rd_cache_sec = 0xFFFFFFFF; }
 
 
 static void blk_wr_cache_push(unsigned int sector, const void *data)
@@ -1192,19 +1150,6 @@ static unsigned short exfat_name_hash(const char *name, int nlen)
     return hash;
 }
 
-static unsigned short exfat_name_hash_ucs2(const unsigned short *name, int nlen)
-{
-    unsigned short hash = 0;
-    int i;
-    for (i = 0; i < nlen; i++) {
-        unsigned short ch = name[i];
-        if (ch >= 'a' && ch <= 'z') ch -= 32;
-        hash = ((hash << 15) | (hash >> 1)) + (ch & 0xFF);
-        hash = ((hash << 15) | (hash >> 1)) + (ch >> 8);
-    }
-    return hash;
-}
-
 // compute entrysetchecksum
 static unsigned short exfat_entry_checksum(const unsigned char *es, int size)
 {
@@ -1484,18 +1429,6 @@ static int strcasecmp_local(const char *a, const char *b)
     return (unsigned char)*a - (unsigned char)*b;
 }
 
-static int strcasecmp_ucs2(const unsigned short *a, const unsigned short *b)
-{
-    while (*a && *b) {
-        unsigned short ca = *a, cb = *b;
-        if (ca >= 'a' && ca <= 'z') ca -= 32;
-        if (cb >= 'a' && cb <= 'z') cb -= 32;
-        if (ca != cb) return (int)ca - (int)cb;
-        a++; b++;
-    }
-    return (int)*a - (int)*b;
-}
-
 static void fat_extract_shortname(const FatDirEntry *entry, char *out)
 {
     int i, j = 0;
@@ -1569,18 +1502,13 @@ static unsigned int fat32_find_in_dir_ex(unsigned int dir_cluster, const char *n
 {
     unsigned char sfn[11];
     int use_sfn = to_fat83(name, sfn);
-    unsigned short lfn_ucs2[256];
+    char lfn_buf[256];
     int lfn_ready = 0;
     unsigned char dir_sec_buf[512] __attribute__((aligned(64)));
 
-    // convert search name to ucs-2 for proper LFN comparison (supports JP/CN/KR codepages)
-    unsigned short name_ucs2[260];
-    memset(name_ucs2, 0, sizeof(name_ucs2));
-    sceCodepage_driver_C899572E(name_ucs2, 260, name);
-
     unsigned int cluster = dir_cluster;
     unsigned int iter32 = 0;
-    memset(lfn_ucs2, 0, sizeof(lfn_ucs2));
+    memset(lfn_buf, 0, sizeof(lfn_buf));
 
     while (cluster >= 2 && cluster < FAT32_EOC && iter32 < fat32_total_clusters) {
         iter32++;
@@ -1602,7 +1530,7 @@ static unsigned int fat32_find_in_dir_ex(unsigned int dir_cluster, const char *n
                     return 0;
 
                 if (entry->name[0] == 0xE5) {
-                    memset(lfn_ucs2, 0, sizeof(lfn_ucs2));
+                    memset(lfn_buf, 0, sizeof(lfn_buf));
                     lfn_ready = 0;
                     continue;
                 }
@@ -1611,8 +1539,8 @@ static unsigned int fat32_find_in_dir_ex(unsigned int dir_cluster, const char *n
                     FatLfnEntry *lfn = (FatLfnEntry *)entry;
                     int seq = lfn->order & 0x3F;
                     if (lfn->order & 0x40)
-                        memset(lfn_ucs2, 0, sizeof(lfn_ucs2));
-                    fat_extract_lfn_part_ucs2(lfn, lfn_ucs2, seq);
+                        memset(lfn_buf, 0, sizeof(lfn_buf));
+                    fat_extract_lfn_part(lfn, lfn_buf, seq);
                     if (seq == 1)
                         lfn_ready = 1;
                     continue;
@@ -1625,8 +1553,8 @@ static unsigned int fat32_find_in_dir_ex(unsigned int dir_cluster, const char *n
 
                 int matched = 0;
 
-                if (lfn_ready && lfn_ucs2[0]) {
-                    if (strcasecmp_ucs2(name_ucs2, lfn_ucs2) == 0)
+                if (lfn_ready && lfn_buf[0]) {
+                    if (strcasecmp_local(name, lfn_buf) == 0)
                         matched = 1;
                 }
 
@@ -1651,7 +1579,7 @@ static unsigned int fat32_find_in_dir_ex(unsigned int dir_cluster, const char *n
                     return cl;
                 }
 
-                memset(lfn_ucs2, 0, sizeof(lfn_ucs2));
+                memset(lfn_buf, 0, sizeof(lfn_buf));
                 lfn_ready = 0;
             }
         }
@@ -2178,13 +2106,10 @@ static unsigned int exfat_find_in_dir(unsigned int dir_cluster,
     unsigned char buf[512] __attribute__((aligned(64)));
     unsigned int iter = 0;
 
-    // convert search name to ucs-2 for proper comparison (supports JP/CN/KR)
-    unsigned short name_ucs2[260];
-    memset(name_ucs2, 0, sizeof(name_ucs2));
-    sceCodepage_driver_C899572E(name_ucs2, 260, name);
+    // precompute namehash so we can skip the full name collect + ascii compare on streamentry mismatch
     int name_len = 0;
-    while (name_ucs2[name_len]) name_len++;
-    unsigned short search_hash = exfat_name_hash_ucs2(name_ucs2, name_len);
+    while (name[name_len]) name_len++;
+    unsigned short search_hash = exfat_name_hash(name, name_len);
 
     while (cluster >= 2 && cluster < FAT32_EOC && iter < exfat_cluster_count) {
         iter++;
@@ -2209,13 +2134,12 @@ static unsigned int exfat_find_in_dir(unsigned int dir_cluster,
                 unsigned int first_cl = 0;
                 unsigned int fsize = 0;
                 int no_chain = 0;
-                unsigned short collected_ucs2[256];
+                char collected_name[256];
                 int name_pos = 0;
                 int subs_read = 0;
                 unsigned int captured_stream_sec = 0;
                 unsigned int captured_stream_off = 0;
                 int name_hash_mismatch = 0;
-                memset(collected_ucs2, 0, sizeof(collected_ucs2));
 
                 // ok,advance to next entry
                 unsigned int eoff = off + 32;
@@ -2259,18 +2183,28 @@ static unsigned int exfat_find_in_dir(unsigned int dir_cluster,
                         for (k = 0; k < 15 && name_pos < 255; k++) {
                             unsigned short ch = ne->name[k];
                             if (ch == 0) break;
-                            collected_ucs2[name_pos++] = ch;
+                            collected_name[name_pos++] = (ch < 128) ? (char)ch : '?';
                         }
                     }
                     subs_read++;
                     eoff += 32;
                 }
 
-                collected_ucs2[name_pos] = 0;
+                collected_name[name_pos] = '\0';
 
                 int match = 0;
                 if (!name_hash_mismatch) {
-                    match = (strcasecmp_ucs2(name_ucs2, collected_ucs2) == 0) ? 1 : 0;
+                    const char *a = name;
+                    const char *b = collected_name;
+                    match = 1;
+                    while (*a && *b) {
+                        char ca = *a, cb = *b;
+                        if (ca >= 'a' && ca <= 'z') ca -= 32;
+                        if (cb >= 'a' && cb <= 'z') cb -= 32;
+                        if (ca != cb) { match = 0; break; }
+                        a++; b++;
+                    }
+                    if (*a || *b) match = 0;
                 }
 
                 if (match && first_cl >= 2) {
@@ -2935,7 +2869,6 @@ static int exfat_IoRemove(PspIoDrvFileArg *arg, const char *name)
             return 0x80010002;
         }
         if (at & 0x10) return 0x80010014;
-        if (file_is_open(cl)) return 0x8001000D;
         const char *b = name; while (*b == '/') b++;
         const char *l = NULL; const char *p = b;
         while (*p) { if (*p == '/') l = p; p++; }
@@ -2973,8 +2906,7 @@ static int exfat_IoRemove(PspIoDrvFileArg *arg, const char *name)
         return 0x80010002;
     }
     // sony checks attr & 0x19 = readonly|volume_id|directory
-    if (attr & 0x19) return 0x8001000D;
-    if (file_is_open(cluster)) return 0x8001000D;
+    if (attr & 0x19) return 0x8001000D; // eacces right?
 
     const char *base = name;
     while (*base == '/') base++;
@@ -3154,7 +3086,6 @@ static int exfat_IoRmdir(PspIoDrvFileArg *arg, const char *name)
         unsigned int cl = exfat_resolve_path(name, &sz, &at, &nc);
         if (cl == 0) return 0x80010002;
         if (!(at & 0x10)) return 0x80010014;
-        if (file_is_open(cl)) return 0x8001000D;
         {
             unsigned char chk[512] __attribute__((aligned(64)));
             unsigned int ccl = cl;
@@ -3203,7 +3134,6 @@ static int exfat_IoRmdir(PspIoDrvFileArg *arg, const char *name)
     unsigned int cluster = fat32_resolve_path(name, &size, &attr);
     if (cluster == 0) return 0x80010002;
     if (!(attr & FAT_ATTR_DIRECTORY)) return 0x80010014;
-    if (file_is_open(cluster)) return 0x8001000D;
 
     // check directory is empty (only . and .. allowed)
     {
@@ -3375,6 +3305,7 @@ static int exfat_IoDread(PspIoDrvFileArg *arg, SceIoDirent *dir)
         // exfat directory enumeration parses 0x85→0xc0→0xc1 entry sets
         // standard filesystem jazz. uses the shared dir read cache to avoid
         // re-reading the same sector for consecutive 32-byte entries.
+        unsigned char *drd_sec_buf = dir_rd_cache_buf;
         while (1) {
             if (f->dir_offset >= exfat_cluster_size) {
                 if (f->no_fat_chain)
@@ -3390,8 +3321,11 @@ static int exfat_IoDread(PspIoDrvFileArg *arg, SceIoDirent *dir)
                 (f->dir_offset / exfat_bytes_per_sector);
             unsigned int sec_off = f->dir_offset % exfat_bytes_per_sector;
 
-            unsigned char *drd_sec_buf = dir_rd_cache_get(sec);
-            if (!drd_sec_buf) return 0;
+            if (sec != dir_rd_cache_sec) {
+                int ret = exfat_blk_read_sectors(sec, drd_sec_buf, 1);
+                if (ret < 0) { dir_rd_cache_invalidate(); return 0; }
+                dir_rd_cache_sec = sec;
+            }
 
             unsigned char etype = drd_sec_buf[sec_off];
             f->dir_offset += 32;
@@ -3425,8 +3359,11 @@ static int exfat_IoDread(PspIoDrvFileArg *arg, SceIoDirent *dir)
                     (f->dir_offset / exfat_bytes_per_sector);
                 sec_off = f->dir_offset % exfat_bytes_per_sector;
 
-                drd_sec_buf = dir_rd_cache_get(sec);
-                if (!drd_sec_buf) break;
+                if (sec != dir_rd_cache_sec) {
+                    int ret2 = exfat_blk_read_sectors(sec, drd_sec_buf, 1);
+                    if (ret2 < 0) { dir_rd_cache_invalidate(); break; }
+                    dir_rd_cache_sec = sec;
+                }
 
                 unsigned char st = drd_sec_buf[sec_off];
                 if (st == EXFAT_ENTRY_STREAM) {
@@ -3494,6 +3431,7 @@ static int exfat_IoDread(PspIoDrvFileArg *arg, SceIoDirent *dir)
     }
 
     // fat32 directory enum also uses the shared dir read cache
+    unsigned char *drd_sec_buf = dir_rd_cache_buf;
     unsigned short ucs2_buf[256]; // use the raw ucs-2 lfn for codepage conversion
     int ucs2_ready = 0;
     while (1) {
@@ -3507,8 +3445,11 @@ static int exfat_IoDread(PspIoDrvFileArg *arg, SceIoDirent *dir)
         unsigned int sec = cluster_to_sector(f->dir_cluster) + (f->dir_offset / fat32_bytes_per_sector);
         unsigned int sec_off = f->dir_offset % fat32_bytes_per_sector;
 
-        unsigned char *drd_sec_buf = dir_rd_cache_get(sec);
-        if (!drd_sec_buf) return 0;
+        if (sec != dir_rd_cache_sec) {
+            int ret = blk_read_sectors(sec, drd_sec_buf, 1);
+            if (ret < 0) { dir_rd_cache_invalidate(); return 0; }
+            dir_rd_cache_sec = sec;
+        }
 
         FatDirEntry *entry = (FatDirEntry *)(drd_sec_buf + sec_off);
         f->dir_offset += 32;
@@ -4119,21 +4060,6 @@ static int exfat_IoUmount(PspIoDrvFileArg *arg, const char *devname)
         }
     }
 
-    // write back FSInfo with current free cluster count (FAT32 only)
-    if (!g_use_exfat && fat32_fsinfo_sector != 0 && blk_fd >= 0) {
-        unsigned char fsi[512] __attribute__((aligned(64)));
-        if (blk_read_sectors(fat32_fsinfo_sector, fsi, 1) >= 0) {
-            unsigned int sig1, sig2;
-            memcpy(&sig1, fsi + 0, 4);
-            memcpy(&sig2, fsi + 484, 4);
-            if (sig1 == 0x41615252 && sig2 == 0x61417272) {
-                memcpy(fsi + 488, &fat32_free_clusters, 4);
-                memcpy(fsi + 492, &fat32_next_free_hint, 4);
-                blk_write_sectors(fat32_fsinfo_sector, fsi, 1);
-            }
-        }
-    }
-
     mount_state = 0x1022;
     media_flags = 0x4000; // media removed
 
@@ -4348,7 +4274,8 @@ static int exfat_IoDevctl(PspIoDrvFileArg *arg, const char *devname,
             unsigned char mbr_scan[512] __attribute__((aligned(64)));
             k_sceIoLseek64k(blk_fd, 0, 0, 0, PSP_SEEK_SET);
             if (k_sceIoRead(blk_fd, mbr_scan, 512) == 512
-                && mbr_scan[510] == 0x55 && mbr_scan[511] == 0xAA) {
+                && mbr_scan[510] == 0x55 && mbr_scan[511] == 0xAA
+                && mbr_scan[0] != 0xEB && mbr_scan[0] != 0xE9) {
                 int pi;
                 for (pi = 0; pi < 4; pi++) {
                     unsigned char *e = mbr_scan + 0x1BE + pi * 16;
@@ -4747,10 +4674,10 @@ static int exfat_IoDevctl(PspIoDrvFileArg *arg, const char *devname,
             *(int *)outdata = fat32_sectors_per_cluster;
         return 0;
 
-    // get the serial number (read from BPB at mount)
+    // get the serial number (when sony uses this it's usually a dummy)
     case 0x02415862:
         if (outdata && outlen >= 4)
-            *(unsigned int *)outdata = fat32_volume_serial;
+            *(unsigned int *)outdata = 0x12345678; // feed dummy serial for now
         return 0;
 
     // get the fs typee
@@ -5302,13 +5229,9 @@ static int __attribute__((noinline)) fat32_init(void)
     fat_cached_sector = 0xFFFFFFFF;
     fat_big_cache_invalidate_all();
 
-    memcpy(&fat32_volume_serial, bpb_buf + 67, 4);
-
     // read fsinfo for free cluster count (sony's is instant, no fat scan)
     fat32_free_clusters = 0;
-    fat32_fsinfo_sector = 0;
     if (bpb->fs_info >= 1 && bpb->fs_info < bpb->reserved_sectors) {
-        fat32_fsinfo_sector = bpb->fs_info;
         unsigned char fsi_buf[512] __attribute__((aligned(64)));
         if (blk_read_sectors(bpb->fs_info, fsi_buf, 1) >= 0) {
             unsigned int sig1, sig2, free_count;
@@ -5353,7 +5276,6 @@ static int __attribute__((used)) exfat_init(void)
     exfat_root_cluster        = *(unsigned int *)(vbr + 96);
     exfat_cluster_count       = *(unsigned int *)(vbr + 92);
     exfat_volume_sectors      = *(unsigned int *)(vbr + 72);
-    memcpy(&fat32_volume_serial, vbr + 100, 4);
     exfat_fat_cached_sector = 0xFFFFFFFF;
     fat_big_cache_invalidate_all();
 
@@ -5582,7 +5504,9 @@ static void do_mount_work_inner(void)
                 unsigned char mbr_cap[512] __attribute__((aligned(64)));
                 k_sceIoLseek64k(blk_fd, 0, 0, 0, PSP_SEEK_SET);
                 if (k_sceIoRead(blk_fd, mbr_cap, 512) == 512
-                    && mbr_cap[510] == 0x55 && mbr_cap[511] == 0xAA) {
+                    && mbr_cap[510] == 0x55 && mbr_cap[511] == 0xAA
+                    && mbr_cap[0] != 0xEB && mbr_cap[0] != 0xE9) {
+                    // compute real card size from MBR partition entries only.
                     unsigned int max_end = 0;
                     int pi;
                     for (pi = 0; pi < 4; pi++) {
@@ -5590,6 +5514,7 @@ static void do_mount_work_inner(void)
                         if (e[4] == 0) continue;
                         unsigned int lba = e[8]|(e[9]<<8)|(e[10]<<16)|(e[11]<<24);
                         unsigned int ns  = e[12]|(e[13]<<8)|(e[14]<<16)|(e[15]<<24);
+                        if (ns == 0) continue; // skip entries with num_sectors=0 (ambiguous "rest of disk")
                         unsigned int end = lba + ns;
                         if (end > max_end) max_end = end;
                     }
@@ -5598,17 +5523,20 @@ static void do_mount_work_inner(void)
                         g_real_total_sectors = max_end;
 
                         // patch msstor sub_03334 to return g_real_total_sectors
-                        // usbstorms's READ CAPACITY cache fill calls msstor IoIoctl 0x02125006 thank you lusid1 !!! (this fixes USB Connection!)
+                        // usbstorms's READ CAPACITY cache fill calls msstor IoIoctl 0x02125006
                         unsigned int gptr = (unsigned int)&g_real_total_sectors;
                         unsigned int hi = (gptr + 0x8000) >> 16;
                         unsigned int lo = gptr & 0xFFFF;
                         volatile unsigned int *p = (volatile unsigned int *)(text_addr + 0x3334);
+                        // disable interrupts during code patch to prevent half-patched execution
+                        int intr = sceKernelCpuSuspendIntr();
                         p[0] = 0x3C020000 | hi;
                         p[1] = 0x8C420000 | lo;
                         p[2] = 0x03E00008;
                         p[3] = 0x00000000;
+                        sceKernelCpuResumeIntr(intr);
                         sceKernelDcacheWritebackInvalidateRange((const void *)p, 16);
-                        sceKernelIcacheInvalidateAll();
+                        sceKernelIcacheInvalidateRange((const void *)p, 16);
                     }
                 }
                 blk_fd_pos = 0xFFFFFFFFFFFFFFFFULL;

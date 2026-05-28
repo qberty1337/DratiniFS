@@ -182,6 +182,11 @@ typedef struct {
     unsigned int sfn_sector; // 324
     unsigned int sfn_index;
     int msstor_fd;
+    // must match OpenFile in main.c — chain checkpoint fields
+    unsigned int ckpt_idx[8];
+    unsigned int ckpt_cluster[8];
+    unsigned char ckpt_count;
+    unsigned char ckpt_next;
 } EsOpenFile;
 
 int es_try_open(PspIoDrvFileArg *arg, char *file, void *open_files_ptr, int max_files)
