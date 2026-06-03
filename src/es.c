@@ -6,6 +6,7 @@
 #include <string.h>
 #include "es.h"
 
+extern void sceKernelDcacheWritebackInvalidateRange(const void *addr, unsigned int size);
 // more globals
 
 int es_initialized = 0;
@@ -49,7 +50,6 @@ static int es_read_abs(unsigned int abs_sector, void *buf, unsigned int count)
     if (es_cached_blk_fd < 0) es_sync_fd();
     if (es_cached_blk_fd < 0) return -1;
     unsigned long long byte_off = (unsigned long long)abs_sector * 512;
-    // check real fd position since es_cached_pos goes stale when main does io through blk_write_sectors typically
     if (byte_off != es_get_blk_fd_pos()) {
         long long sr = k_sceIoLseek64k(es_cached_blk_fd, 0,
             (unsigned int)(byte_off & 0xFFFFFFFF),
@@ -211,6 +211,15 @@ int es_try_open(PspIoDrvFileArg *arg, char *file, void *open_files_ptr, int max_
     return 0;
 }
 
+// data install breakthrough: from trench testing ram spillage manually on device, it looks like we should only bounce
+// small unaligned reads (dir/metadata) that are 4 byte aligned... larger unaligned reads DMA directly, so bouncing really
+// can never chunk the multi MB launch stream and stall the boot
+// the spillage was the issue
+// so let's just try not to touch this path unless absolutely needed... should a piano fall on it's head, worse things fall on ours
+#define ES_ABOUNCE_SECTORS 8
+#define ES_ABOUNCE_MAX 8192
+static unsigned char es_abounce[ES_ABOUNCE_SECTORS * 512] __attribute__((aligned(64)));
+
 int es_io_read(void *file_ptr, char *data, int len)
 {
     EsOpenFile *f = (EsOpenFile *)file_ptr;
@@ -233,19 +242,41 @@ int es_io_read(void *file_ptr, char *data, int len)
             unsigned int nsectors = ((unsigned int)len) / 512;
             unsigned int iso_left = ent->size_sectors - sec_in_iso;
             if (nsectors > iso_left) nsectors = iso_left;
-            int ret = es_read_abs(abs_sector, data, nsectors);
-            if (ret < 0) return total_read > 0 ? total_read : ret;
             unsigned int bulk = nsectors * 512;
+
+            // this should finally fix data install games not working (utilizing es bounce buffer)
+            int aligned64 = (((unsigned int)(unsigned long)data & 63) == 0);
+            if (aligned64 || bulk > ES_ABOUNCE_MAX) {
+                int ret = es_read_abs(abs_sector, data, nsectors);
+                if (ret < (int)bulk) return total_read > 0 ? total_read : (ret < 0 ? ret : (int)0x80010013);
+                if (aligned64) sceKernelDcacheWritebackInvalidateRange(data, bulk);
+            } else {
+                unsigned int got = 0;
+                while (got < nsectors) {
+                    unsigned int csec = nsectors - got;
+                    if (csec > ES_ABOUNCE_SECTORS) csec = ES_ABOUNCE_SECTORS;
+                    int ret = es_read_abs(abs_sector + got, es_abounce, csec);
+                    unsigned int cb = csec * 512;
+                    if (ret < (int)cb) return total_read > 0 ? total_read : (ret < 0 ? ret : (int)0x80010013);
+                    sceKernelDcacheWritebackInvalidateRange(es_abounce, cb);
+                    memcpy(data + got * 512, es_abounce, cb);
+                    sceKernelDcacheWritebackInvalidateRange(data + got * 512, cb);
+                    got += csec;
+                }
+            }
             data += bulk; f->position += bulk;
             total_read += bulk; len -= bulk;
         } else {
             static unsigned char es_bounce[512] __attribute__((aligned(64)));
             int ret = es_read_abs(abs_sector, es_bounce, 1);
-            if (ret < 0) return total_read > 0 ? total_read : ret;
+            if (ret < 512) return total_read > 0 ? total_read : (ret < 0 ? ret : (int)0x80010013);
+            // es_bounce was just dma-filled, invalidate the whole sector sothe memcpy below reads the fresh bytes, not a stale cache line
+            sceKernelDcacheWritebackInvalidateRange(es_bounce, 512);
             unsigned int chunk = 512 - sec_offset;
             if (chunk > (unsigned int)len) chunk = (unsigned int)len;
-            // increase performance by doing a memcpy instead of a dcache flush like sony does
             memcpy(data, es_bounce + sec_offset, chunk);
+             // flush memcpy'd bytes to RAM for DMA consumers (needed for data install games to work!! finally!)
+            sceKernelDcacheWritebackInvalidateRange(data, chunk);
             data += chunk; f->position += chunk;
             total_read += chunk; len -= chunk;
         }
