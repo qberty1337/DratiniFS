@@ -194,6 +194,7 @@ static int g_use_exfat = 0; // 1 = exfat filesystem, 0 = fat32 (should I add fat
 static volatile int fs_initialized = 0; // set by deferred_fs_init on first iodevctl
 static volatile int deferred_fs_init_in_progress = 0; // re-entrancy guard so iomount->deferred->sceioassign->iomount doesn't recurse
 static volatile unsigned int g_real_total_sectors = 0;
+static unsigned int g_dir_flush_ctr = 0;
 
 // detect stale blk_fd -- sceiocloseall kills kernel fds during game launch
 static int blk_fd_validated = 0;
@@ -2391,6 +2392,19 @@ static int exfat_IoClose(PspIoDrvFileArg *arg)
             exfat_update_dir_entry(f->parent_cluster, f->first_cluster,
                                    f->first_cluster, f->file_size, f->parent_no_fat_chain);
         }
+        else if (!g_use_exfat && f->is_dirty && f->writable && !f->is_dir && f->sfn_sector != 0) {
+            // persist the deferred FAT32 dir-entry size/cluster on close (see write throttle)
+            unsigned char de_buf[512] __attribute__((aligned(64)));
+            if (blk_read_sectors(f->sfn_sector, de_buf, 1) >= 0) {
+                FatDirEntry *de = (FatDirEntry *)(de_buf + f->sfn_index);
+                de->file_size = f->file_size;
+                de->cluster_hi = (unsigned short)(f->first_cluster >> 16);
+                de->cluster_lo = (unsigned short)(f->first_cluster & 0xFFFF);
+                de->attr |= FAT_ATTR_ARCHIVE;
+                blk_write_sectors(f->sfn_sector, de_buf, 1);
+                blk_wr_cache_push(f->sfn_sector, de_buf);
+            }
+            }
         // flush deferred fat2 writes before releasing fd
         fat2_flush();
         f->in_use = 0;
@@ -2607,8 +2621,9 @@ static int exfat_IoWrite(PspIoDrvFileArg *arg, const char *data, int len)
                     de->cluster_hi = (unsigned short)(f->first_cluster >> 16);
                     de->cluster_lo = (unsigned short)(f->first_cluster & 0xFFFF);
                     de->attr |= FAT_ATTR_ARCHIVE;
+                    blk_wr_cache_push(f->sfn_sector, de_buf); // always fresh for read-back
+                    if ((++g_dir_flush_ctr & 31) == 0) // persist to disk only every 32 writes
                     blk_write_sectors(f->sfn_sector, de_buf, 1);
-                    blk_wr_cache_push(f->sfn_sector, de_buf);
                 }
             }
             else if (g_use_exfat && f->sfn_sector != 0) {
