@@ -1,640 +1,406 @@
-// extremespeed raw iso partition
-// separate translation so gcc doesn't change optimization decisions for pre-es vfs functions from the main.c (at least... that's the idea...)
+/* es.c - ExtremeSpeed (ES) partitions (DratiniFS; research/docs/FEATURE_PLAN.md phase 4).
+ * An MBR partition of type 0xDA holds ISOs back to back (format v3: shared/extremespeed_format.h,
+ * written by the ES app and the PC tool). They appear as read-only files under ms0: by their stored
+ * names ("ISO/Genre/x.iso"), with DratiniFS's rules:
+ *   - read-only opens and getstat look in ES first (so the fast copy is used when the original is
+ *     still in ms0:/ISO); writes, creates and truncates only ever see the filesystem;
+ *   - remove tries the filesystem first ("delete original after transfer" removes the FS copy) and
+ *     only then deactivates the ES entry;
+ *   - a directory listing shows the filesystem's entries, then the ES files of that directory and the
+ *     subdirectories that exist only in ES names (which can be opened and stat'ed, for GCLite);
+ *   - ES entries carry the date 1992-03-27 (the ES app recognises them by it);
+ *   - unknown ioctls on an ES file succeed;
+ *   - devctls 0x04100001..7 serve the ES app (raw sectors, info, rescan, format, version).
+ * ES data is read through Sony's own block handle (msstor0p1:) at the ES partition's offset from the
+ * FS partition, with Sony's bounce rules; msstor_cap.c lets those seeks pass the adapter's size.
+ * The table and the used part of the name pool are loaded at mount (fatfs_prep) into one Fpl block. */
+#include "fatms.h"
+#include "../shared/extremespeed_format.h"
 
-#include <pspkernel.h>
-#include <pspiofilemgr.h>
-#include <string.h>
-#include "es.h"
+#define ES_TAG     0x45535344u                   /* OpenFile.rsv[1] of an ES file ("DSSE") */
+#define ES_DHMAGIC 0x45534448u                   /* ES state in a dir handle */
+#define ES_DATE    ((u32)(((1992 - 1980) << 9) | (3 << 5) | 27) << 16)   /* 1992-03-27 00:00:00 (DOS) */
 
-extern void sceKernelDcacheWritebackInvalidateRange(const void *addr, unsigned int size);
-// more globals
+typedef struct { u32 start, size, flags, name_off, name_len; } es_ent;
+/* per dir handle, behind the exFAT state in the same 0x800 block */
+typedef struct { u32 magic, phase, idx, virt; u16 dir[0x104]; } es_dh;
+#define ESDH(d) ((es_dh *)((u8 *)(d) + 0x5a0))
+_Static_assert(0x5a0 + sizeof(es_dh) <= 0x800, "dir handle room");
 
-int es_initialized = 0;
-int es_iso_count = 0;
-ExtremeSpeedEntry es_table[ES_MAX_ISOS];
-static unsigned char es_name_pool[ES_NAME_POOL_BYTES] __attribute__((aligned(64)));
-static unsigned int es_partition_start = 0;
-static unsigned int es_data_start_sec = 0;
-char es_dir_paths[16][256];
+static struct {
+    int on;
+    fatms_ctx *c;                                /* the Memory Stick volume it belongs to */
+    u32 lba, rel;                                /* ES partition: absolute LBA, and from msstor0p1:'s start */
+    u32 n, data_start, total;                    /* table entries (iso_count), data start, partition size */
+    es_ent *e;
+    char *pool;
+    u32 pool_len;
+    SceUID fpl;
+    u8 bounce[16 * 512] __attribute__((aligned(64)));   /* raw devctl transfers to unaligned buffers */
+} E;
 
-// resolve entry [idx]'s name via the in RAM pool and return "" for invalid entries
-static const char *es_get_name(int idx)
+static u32 le32(const u8 *p) { return (u32)(p[0] | p[1] << 8 | p[2] << 16 | (u32)p[3] << 24); }
+static u32 le16(const u8 *p) { return (u32)(p[0] | p[1] << 8); }
+static u16 up(u16 c) { return (c >= 'a' && c <= 'z') ? (u16)(c - 0x20) : c; }
+static int on(const fatms_ctx *c) { return E.on && E.c == c; }   /* ES files show only on that volume */
+
+/* ---------------- loading ---------------- */
+void es_load(fatms_ctx *c)
 {
-    if (idx < 0 || idx >= ES_MAX_ISOS) return "";
-    const ExtremeSpeedEntry *e = &es_table[idx];
-    if (e->name_len == 0) return "";
-    if (e->name_off >= ES_NAME_POOL_BYTES) return "";
-    if ((unsigned int)e->name_off + (unsigned int)e->name_len >= ES_NAME_POOL_BYTES) return "";
-    return (const char *)&es_name_pool[e->name_off];
-}
-
-// cache blk_fd locally to try and avoid cross-translation unit accessor calls on every read (I couldn't get the POC to work without this tbh)
-static int es_cached_blk_fd = -1;
-static unsigned long long es_cached_pos = 0xFFFFFFFFFFFFFFFFULL;
-
-static void es_sync_fd(void)
-{
-    es_cached_blk_fd = es_get_blk_fd();
-    es_cached_pos = es_get_blk_fd_pos();
-}
-
-// force the cache to be invalidated
-void es_sync_blk_fd(void)
-{
-    es_cached_blk_fd = -1;
-    es_cached_pos = 0xFFFFFFFFFFFFFFFFULL;
-}
-
-static int es_read_abs(unsigned int abs_sector, void *buf, unsigned int count)
-{
-    if (es_cached_blk_fd < 0) es_sync_fd();
-    if (es_cached_blk_fd < 0) return -1;
-    unsigned long long byte_off = (unsigned long long)abs_sector * 512;
-    if (byte_off != es_get_blk_fd_pos()) {
-        long long sr = k_sceIoLseek64k(es_cached_blk_fd, 0,
-            (unsigned int)(byte_off & 0xFFFFFFFF),
-            (unsigned int)(byte_off >> 32), 0);
-        if (sr < 0) return (int)sr;
-    }
-    if (count > 0x800000) return -1;
-    unsigned int nbytes = count * 512;
-    int bytes = k_sceIoRead(es_cached_blk_fd, buf, nbytes);
-    if (bytes > 0) {
-        es_cached_pos = byte_off + bytes;
-        es_set_blk_fd_pos(es_cached_pos);
-    } else {
-        es_cached_pos = 0xFFFFFFFFFFFFFFFFULL;
-        es_set_blk_fd_pos(es_cached_pos);
-    }
-    return bytes;
-}
-
-static int es_write_abs(unsigned int abs_sector, const void *buf, unsigned int count)
-{
-    int fd = es_get_blk_fd();
-    if (fd < 0) return -1;
-    unsigned long long byte_off = (unsigned long long)abs_sector * 512;
-    if (byte_off != es_get_blk_fd_pos()) {
-        long long sr = k_sceIoLseek64k(fd, 0,
-            (unsigned int)(byte_off & 0xFFFFFFFF),
-            (unsigned int)(byte_off >> 32), 0);
-        if (sr < 0) return (int)sr;
-    }
-    if (count > 0x800000) return -1;
-    unsigned int nbytes = count * 512;
-    int bytes = k_sceIoWrite(fd, buf, nbytes);
-    if (bytes > 0) {
-        es_set_blk_fd_pos(byte_off + bytes);
-        es_cached_pos = byte_off + bytes;
-    } else {
-        es_set_blk_fd_pos(0xFFFFFFFFFFFFFFFFULL);
-        es_cached_pos = 0xFFFFFFFFFFFFFFFFULL;
-    }
-    return bytes;
-}
-
-static int es_stricmp(const char *a, const char *b)
-{
-    while (*a && *b) {
-        char ca = *a, cb = *b;
-        if (ca >= 'A' && ca <= 'Z') ca += 32;
-        if (cb >= 'A' && cb <= 'Z') cb += 32;
-        if (ca != cb) return ca - cb;
-        a++; b++;
-    }
-    return (unsigned char)*a - (unsigned char)*b;
-}
-
-static int es_find_iso(const char *file)
-{
-    if (!es_initialized || es_iso_count <= 0) return -1;
-    while (*file == '/') file++;
-    int i;
-    for (i = 0; i < es_iso_count; i++) {
-        if (!(es_table[i].flags & ES_FLAG_ACTIVE)) continue;
-        if (es_stricmp(file, es_get_name(i)) == 0)
-            return i;
-    }
-    return -1;
-}
-
-// check whether any active es entry's filename begins with the given directory prefix followed by '/'.
-// used to expose virtual subfolders like "ISO/Genre/" that only exist inside es entries.
-int es_check_dir_prefix(const char *dir)
-{
-    if (!es_initialized || es_iso_count <= 0) return 0;
-    while (*dir == '/') dir++;
-    int dlen = 0;
-    while (dir[dlen]) dlen++;
-    if (dlen == 0) return 0;
-
-    int i;
-    for (i = 0; i < es_iso_count; i++) {
-        if (!(es_table[i].flags & ES_FLAG_ACTIVE)) continue;
-        const char *fn = es_get_name(i);
-        if (es_table[i].name_len <= (uint16_t)dlen) continue;
-        int match = 1, j;
-        for (j = 0; j < dlen; j++) {
-            char a = fn[j], b = dir[j];
-            if (a >= 'A' && a <= 'Z') a += 32;
-            if (b >= 'A' && b <= 'Z') b += 32;
-            if (a != b) { match = 0; break; }
+    if (c->ops != &g_ms_ops) return;                                     /* Memory Stick only (not the Go's storage) */
+    E.on = 0;
+    E.c = c;
+    if (E.fpl > 0) { sceKernelDeleteFpl(E.fpl); E.fpl = 0; }
+    u8 t, t0; u32 lba = 0, len = 0, p0, l0;
+    if ((c->flags & ST_WHOLEDISK) || mbr_entry(0, &t0, &p0, &l0) < 0) return;
+    for (int i = 0; i < 4 && !lba; i++) if (mbr_entry(i, &t, &lba, &len) < 0 || t != ES_PARTITION_TYPE) lba = 0;
+    if (!lba || lba <= p0) return;                                       /* msstor0p1: can't reach it */
+    u8 *b = fatfs_get_scratch(c);
+    if (!b) return;
+    E.lba = lba; E.rel = lba - p0;
+    u32 n = 0, pool = 0, need = 0;
+    int r = c->blk->read_sectors(c, b, E.rel, 1);
+    if (r < 0 || le32(b) != ES_MAGIC || le32(b + 4) != ES_VERSION) goto out;
+    n = le32(b + 8); pool = le32(b + 28);
+    if (n > ES_MAX_ISOS) n = ES_MAX_ISOS;
+    if (pool > ES_NAME_POOL_BYTES) pool = ES_NAME_POOL_BYTES;
+    E.data_start = le32(b + 12); E.total = le32(b + 16);
+    need = n * sizeof(es_ent) + pool + 1;
+    u8 *m = (u8 *)fatfs_alloc_block(&E.fpl, (int)((need + 63) & ~63u), "SceFatfsES");
+    if (!m) goto out;
+    E.e = (es_ent *)m; E.pool = (char *)(m + n * sizeof(es_ent)); E.pool_len = pool;
+    for (u32 s = 0; s * 8 < n; s++) {                                   /* the table: 8 entries per sector */
+        if ((r = c->blk->read_sectors(c, b, E.rel + ES_TABLE_FIRST_SECTOR + s, 1)) < 0) goto out;
+        for (u32 k = 0; k < 8 && s * 8 + k < n; k++) {
+            const u8 *x = b + k * ES_ENTRY_SIZE;
+            es_ent *e = &E.e[s * 8 + k];
+            e->start = le32(x + 16); e->size = le32(x + 24); e->flags = le32(x + 28);
+            e->name_off = le32(x + 32); e->name_len = le16(x + 36);
+            if (e->name_len == 0 || e->name_off + e->name_len > pool || e->name_len >= ES_NAME_MAX_LEN) e->flags = 0;
         }
-        if (match && fn[dlen] == '/') return 1;
     }
+    for (u32 off = 0; off < pool; off += 512) {                        /* the used part of the name pool */
+        if ((r = c->blk->read_sectors(c, b, E.rel + ES_NAME_POOL_START_SECTOR + off / 512, 1)) < 0) goto out;
+        memcpy(E.pool + off, b, pool - off < 512 ? pool - off : 512);
+    }
+    E.pool[pool] = 0;
+    E.n = n;
+    E.on = 1;
+out:
+    fatfs_put_scratch(c, b);
+    if (!E.on && E.fpl > 0) { sceKernelDeleteFpl(E.fpl); E.fpl = 0; }
+}
+
+/* ---------------- names ---------------- */
+/* entry i's stored name ("ISO/x.iso", UTF-8) as a Sony path ("\ISO\x.iso") -> w (0x104 chars) */
+static void es_name(u32 i, u16 *w)
+{
+    char tmp[ES_NAME_MAX_LEN + 1];
+    u32 n = E.e[i].name_len;
+    memcpy(tmp, E.pool + E.e[i].name_off, n);
+    tmp[n] = 0;
+    w[0] = '\\';
+    sceCodepage_driver_C899572E(w + 1, 0x206, tmp);
+    for (u16 *s = w; *s; s++) if (*s == '/') *s = '\\';
+}
+/* case-insensitive compare of n chars (ASCII folding, as Sony's names) */
+static int same(const u16 *a, const u16 *b, int n) { for (int i = 0; i < n; i++) if (up(a[i]) != up(b[i])) return 0; return 1; }
+static int es_find(fatms_ctx *c, const fpath *p)                         /* the active entry at path p */
+{
+    u16 *w = (u16 *)fatfs_get_scratch(c);
+    if (!w) return -1;
+    int dl = fp_wcslen(p->dir), ll = fp_wcslen(p->leaf), hit = -1;
+    for (u32 i = 0; i < E.n && hit < 0; i++) {
+        if (!(E.e[i].flags & ES_FLAG_ACTIVE)) continue;
+        es_name(i, w);
+        if (fp_wcslen(w) == dl + ll && same(w, p->dir, dl) && same(w + dl, p->leaf, ll)) hit = (int)i;
+    }
+    fatfs_put_scratch(c, w);
+    return hit;
+}
+/* does some active entry live under directory `dir` ("\ISO\Genre\")? */
+static int es_under(fatms_ctx *c, const u16 *dir)
+{
+    u16 *w = (u16 *)fatfs_get_scratch(c);
+    if (!w) return 0;
+    int dl = fp_wcslen(dir), hit = 0;
+    for (u32 i = 0; i < E.n && !hit; i++) {
+        if (!(E.e[i].flags & ES_FLAG_ACTIVE)) continue;
+        es_name(i, w);
+        hit = fp_wcslen(w) > dl && same(w, dir, dl);
+    }
+    fatfs_put_scratch(c, w);
+    return hit;
+}
+static void es_entry32(u8 *ent, u32 attr, u32 size)                    /* Sony's 32-byte entry for an ES item */
+{
+    memset(ent, ' ', 11); memset(ent + 11, 0, 21);
+    ent[0x0b] = (u8)attr;
+    u32 d = ES_DATE;
+    memcpy(ent + 0x0e, &d, 4); memcpy(ent + 0x16, &d, 4);
+    ent[0x12] = (u8)(d >> 16); ent[0x13] = (u8)(d >> 24);
+    memcpy(ent + 0x1c, &size, 4);
+}
+
+/* ---------------- files ---------------- */
+/* read-only open: ES first. FAT_ENOENT = not an ES file (the caller goes on to the filesystem);
+   other errors are prep's, the same the filesystem open would return. */
+int es_open(fatms_ctx *c, fpath *p, unsigned flags, OpenFile **out)
+{
+    int r = fatfs_prep(c);
+    if (r >= 0) r = fatfs_ready(c);
+    if (r < 0) return r;
+    if (!on(c) || (flags & 0x602)) return FAT_ENOENT;
+    int i = es_find(c, p), idx = 0;
+    if (i < 0) return FAT_ENOENT;
+    if ((r = flagcheck(flags, 1)) < 0) return r;
+    u32 st = slot_scan(c, p, &idx);
+    if (st == 0 || st == 2) return FAT_EMFILE;
+    OpenFile *f = (OpenFile *)c->fd[idx];
+    memset(f, 0, sizeof(*f));
+    memcpy(&f->path, p, sizeof(fpath));
+    es_entry32(f->entry, 0x20, E.e[i].size);
+    f->rsv[1] = ES_TAG; f->rsv[2] = (u32)i;
+    f->inuse++;
+    if (flags & 0x100) f->position = F_SIZE(f);
+    f->oflags = flags;
+    *out = f;
     return 0;
 }
+int es_is_file(OpenFile *f) { return f && f->rsv[1] == ES_TAG; }
 
-static unsigned int es_next_free(void)
+/* fatfs_read for an ES file: contiguous sectors at the partition's offset, partial ones bounced */
+int es_read(fatms_ctx *c, OpenFile *f, void *buf, int len)
 {
-    unsigned int next = es_data_start_sec;
-    int i;
-    for (i = 0; i < es_iso_count; i++) {
-        if (!(es_table[i].flags & ES_FLAG_ACTIVE)) continue;
-        unsigned int end = es_table[i].start_sector + es_table[i].size_sectors;
-        if (end < es_table[i].start_sector) continue;
-        if (end > next) next = end;
-    }
-    return next;
-}
-
-// pub stuffs
-
-typedef struct {
-    int in_use;
-    int is_dir;
-    int writable;
-    int is_dirty;
-    unsigned int first_cluster;
-    unsigned int orig_first_cluster;
-    unsigned int file_size;
-    unsigned int position;
-    unsigned int tail_cluster;
-    unsigned int parent_cluster;
-    unsigned int dir_cluster;
-    unsigned int dir_offset;
-    unsigned int cur_cluster;
-    unsigned int cur_cluster_index;
-    char lfn_buf[256]; // 56 pin this down!!
-    int lfn_ready;
-    int no_fat_chain;
-    int parent_no_fat_chain; // 320 pinm htis down too!!
-    unsigned int sfn_sector; // 324
-    unsigned int sfn_index;
-    int msstor_fd;
-    // must match OpenFile in main.c — chain checkpoint fields
-    unsigned int ckpt_idx[8];
-    unsigned int ckpt_cluster[8];
-    unsigned char ckpt_count;
-    unsigned char ckpt_next;
-} EsOpenFile;
-
-int es_try_open(PspIoDrvFileArg *arg, char *file, void *open_files_ptr, int max_files)
-{
-    int es_idx = es_find_iso(file);
-    if (es_idx < 0) return -1;
-
-    // look for free fd's... probably is a better way to do this...
-    EsOpenFile *files = (EsOpenFile *)open_files_ptr;
-    int fd = -1, i;
-    for (i = 0; i < max_files; i++) {
-        if (!files[i].in_use) { fd = i; break; }
-    }
-    if (fd < 0) return 0x80000020;
-
-    memset(&files[fd], 0, sizeof(EsOpenFile));
-    files[fd].in_use = 1;
-    files[fd].file_size = es_table[es_idx].size_lo;
-    files[fd].first_cluster = 0xE5000000 | (unsigned int)es_idx;
-    files[fd].no_fat_chain = 2;
-    arg->arg = (void *)fd;
-    return 0;
-}
-
-// data install breakthrough: from trench testing ram spillage manually on device, it looks like we should only bounce
-// small unaligned reads (dir/metadata) that are 4 byte aligned... larger unaligned reads DMA directly, so bouncing really
-// can never chunk the multi MB launch stream and stall the boot
-// the spillage was the issue
-// so let's just try not to touch this path unless absolutely needed... should a piano fall on it's head, worse things fall on ours
-#define ES_ABOUNCE_SECTORS 8
-#define ES_ABOUNCE_MAX 8192
-static unsigned char es_abounce[ES_ABOUNCE_SECTORS * 512] __attribute__((aligned(64)));
-
-int es_io_read(void *file_ptr, char *data, int len)
-{
-    EsOpenFile *f = (EsOpenFile *)file_ptr;
-    int es_idx = (int)(f->first_cluster & 0x00FFFFFF);
-    if (es_idx < 0 || es_idx >= es_iso_count) return -1;
-
-    const ExtremeSpeedEntry *ent = &es_table[es_idx];
-    unsigned int remaining = f->file_size - f->position;
-    if ((unsigned int)len > remaining) len = (int)remaining;
-    if (len <= 0) return 0;
-
-    int total_read = 0;
-    while (len > 0) {
-        unsigned int sec_in_iso = f->position / 512;
-        unsigned int sec_offset = f->position % 512;
-        unsigned int abs_sector = es_partition_start + ent->start_sector + sec_in_iso;
-
-        if (sec_offset == 0 && (unsigned int)len >= 512
-            && ((unsigned int)(unsigned long)data & 3) == 0) {
-            unsigned int nsectors = ((unsigned int)len) / 512;
-            unsigned int iso_left = ent->size_sectors - sec_in_iso;
-            if (nsectors > iso_left) nsectors = iso_left;
-            unsigned int bulk = nsectors * 512;
-
-            // this should finally fix data install games not working (utilizing es bounce buffer)
-            int aligned64 = (((unsigned int)(unsigned long)data & 63) == 0);
-            if (aligned64 || bulk > ES_ABOUNCE_MAX) {
-                int ret = es_read_abs(abs_sector, data, nsectors);
-                if (ret < (int)bulk) return total_read > 0 ? total_read : (ret < 0 ? ret : (int)0x80010013);
-                if (aligned64) sceKernelDcacheWritebackInvalidateRange(data, bulk);
-            } else {
-                unsigned int got = 0;
-                while (got < nsectors) {
-                    unsigned int csec = nsectors - got;
-                    if (csec > ES_ABOUNCE_SECTORS) csec = ES_ABOUNCE_SECTORS;
-                    int ret = es_read_abs(abs_sector + got, es_abounce, csec);
-                    unsigned int cb = csec * 512;
-                    if (ret < (int)cb) return total_read > 0 ? total_read : (ret < 0 ? ret : (int)0x80010013);
-                    sceKernelDcacheWritebackInvalidateRange(es_abounce, cb);
-                    memcpy(data + got * 512, es_abounce, cb);
-                    sceKernelDcacheWritebackInvalidateRange(data + got * 512, cb);
-                    got += csec;
-                }
-            }
-            data += bulk; f->position += bulk;
-            total_read += bulk; len -= bulk;
+    if (!(f->oflags & 1)) return FAT_EACCES;
+    u32 pos = f->position, size = F_SIZE(f), n = (u32)len, i = f->rsv[2], done = 0;
+    if (pos >= size || i >= E.n) return 0;                               /* past the end: nothing */
+    if (size - pos < n) n = size - pos;
+    u32 base = E.rel + E.e[i].start;
+    u8 *p = (u8 *)buf;
+    while (done < n) {
+        u32 lba = base + pos / 512, off = pos % 512, got;
+        int r;
+        if (off == 0 && n - done >= 512) {
+            got = (n - done) & ~511u;
+            r = c->blk->read_sectors(c, p, lba, got / 512);
         } else {
-            static unsigned char es_bounce[512] __attribute__((aligned(64)));
-            int ret = es_read_abs(abs_sector, es_bounce, 1);
-            if (ret < 512) return total_read > 0 ? total_read : (ret < 0 ? ret : (int)0x80010013);
-            // es_bounce was just dma-filled, invalidate the whole sector sothe memcpy below reads the fresh bytes, not a stale cache line
-            sceKernelDcacheWritebackInvalidateRange(es_bounce, 512);
-            unsigned int chunk = 512 - sec_offset;
-            if (chunk > (unsigned int)len) chunk = (unsigned int)len;
-            memcpy(data, es_bounce + sec_offset, chunk);
-             // flush memcpy'd bytes to RAM for DMA consumers (needed for data install games to work!! finally!)
-            sceKernelDcacheWritebackInvalidateRange(data, chunk);
-            data += chunk; f->position += chunk;
-            total_read += chunk; len -= chunk;
+            u8 *sb = fatfs_get_scratch(c);
+            if (!sb) return FAT_ENOMEM;
+            got = 512 - off < n - done ? 512 - off : n - done;
+            r = c->blk->read_sectors(c, sb, lba, 1);
+            if (r >= 0) memcpy(p, sb + off, got);
+            fatfs_put_scratch(c, sb);
         }
+        if (r < 0) { if (done) break; return r; }
+        p += got; pos += got; done += got;
     }
-    return total_read;
+    f->position = pos;
+    return (int)done;
 }
 
-int es_try_getstat(const char *file, SceIoStat *stat)
+int es_getstat(fatms_ctx *c, fpath *p, SceIoStat *st)                  /* ES first (DratiniFS) */
 {
-    int es_idx = es_find_iso(file);
-    if (es_idx < 0) return -1;
-    memset(stat, 0, sizeof(SceIoStat));
-    stat->st_size = es_table[es_idx].size_lo;
-    stat->st_mode = 0x21FF;
-    stat->st_attr = 0x20;
-    // use magic date 1992-03-27 (my birthday!) to mark es entries (check the ISO's date in XMB :p)
-    stat->sce_st_ctime.year = 1992; stat->sce_st_ctime.month = 3; stat->sce_st_ctime.day = 27;
-    stat->sce_st_mtime.year = 1992; stat->sce_st_mtime.month = 3; stat->sce_st_mtime.day = 27;
-    stat->sce_st_atime.year = 1992; stat->sce_st_atime.month = 3; stat->sce_st_atime.day = 27;
+    int r = fatfs_prep(c);
+    if (r >= 0) r = fatfs_ready(c);
+    if (r < 0) return r;
+    int i = on(c) ? es_find(c, p) : -1;
+    if (i < 0) return FAT_ENOENT;
+    u8 ent[32];
+    es_entry32(ent, 0x20, E.e[i].size);
+    dirent_stat(ent, st);
+    return 0;
+}
+/* a directory that exists only in ES names ("ISO/Genre/..."), after the filesystem said ENOENT */
+int es_vdir(fatms_ctx *c, fpath *p, SceIoStat *st)
+{
+    if (!on(c)) return FAT_ENOENT;
+    u16 *w = (u16 *)fatfs_get_scratch(c);
+    if (!w) return FAT_ENOMEM;
+    fp_wcscpy(w, p->dir);
+    int n = fp_wcslen(w), ll = fp_wcslen(p->leaf);
+    if (n + ll + 1 >= 0x104) { fatfs_put_scratch(c, w); return FAT_ENOENT; }
+    fp_wcscpy(w + n, p->leaf); w[n + ll] = '\\'; w[n + ll + 1] = 0;
+    int hit = es_under(c, w);
+    fatfs_put_scratch(c, w);
+    if (!hit) return FAT_ENOENT;
+    if (st) { u8 ent[32]; es_entry32(ent, 0x10, 0); dirent_stat(ent, st); }
     return 0;
 }
 
-int es_try_ioctl(int no_fat_chain)
+int es_remove(fatms_ctx *c, fpath *p)                                  /* after the filesystem said ENOENT */
 {
-    return (no_fat_chain == 2) ? 0 : -1;
+    int idx, i = on(c) ? es_find(c, p) : -1;
+    if (i < 0) return FAT_ENOENT;
+    if (c->media_flags & MF_WP) return FAT_EACCES;
+    if (slot_scan(c, p, &idx) & 2) return FAT_EACCES;                    /* open */
+    u8 *b = fatfs_get_scratch(c);
+    if (!b) return FAT_ENOMEM;
+    u32 lba = E.rel + ES_TABLE_FIRST_SECTOR + (u32)i / 8;
+    int r = c->blk->read_sectors(c, b, lba, 1);
+    if (r >= 0) {
+        u8 *x = b + (i % 8) * ES_ENTRY_SIZE;
+        u32 fl = le32(x + 28) & ~(u32)ES_FLAG_ACTIVE;
+        memcpy(x + 28, &fl, 4);
+        if ((r = c->blk->write_sectors(c, b, lba, 1)) >= 0) E.e[i].flags = fl;
+    }
+    fatfs_put_scratch(c, b);
+    return r < 0 ? r : 0;
 }
 
-int es_try_remove(const char *file)
+/* ---------------- directories ---------------- */
+/* after dopen (real or virtual): remember the directory for the listing overlay */
+void es_dir_init(fatms_ctx *c, DirHandle *d, const fpath *p, int virt)
 {
-    int idx = es_find_iso(file);
-    if (idx < 0) return -1;
+    es_dh *h = ESDH(d);
+    h->magic = on(c) ? ES_DHMAGIC : 0;
+    h->phase = h->idx = 0;
+    h->virt = (u32)virt;
+    fp_wcsncpy(h->dir, p->dir, 0x104);
+}
+int es_dir_virtual(DirHandle *d) { return ESDH(d)->magic == ES_DHMAGIC && ESDH(d)->virt; }
 
-    es_table[idx].flags &= ~ES_FLAG_ACTIVE;
-
-    unsigned int sec = (unsigned int)idx / ES_ENTRIES_PER_SECTOR;
-    unsigned int slot = (unsigned int)idx % ES_ENTRIES_PER_SECTOR;
-    static unsigned char rmw_buf[512] __attribute__((aligned(64)));
-    if (es_read_abs(es_partition_start + 1 + sec, rmw_buf, 1) < 0) return -1;
-    memcpy(rmw_buf + slot * ES_ENTRY_SIZE, &es_table[idx], ES_ENTRY_SIZE);
-    es_write_abs(es_partition_start + 1 + sec, rmw_buf, 1);
+/* a dir handle for a directory that exists only in ES names (the filesystem listing is empty) */
+int es_dopen(fatms_ctx *c, fpath *p, DirHandle **out)
+{
+    fpath q;
+    *out = 0;
+    int n = fp_wcslen(p->dir);
+    if (n < 2) return FAT_ENOENT;                                        /* "\" is never virtual */
+    fp_wcsncpy(q.dir, p->dir, 0x104);
+    q.dir[n - 1] = 0;                                                     /* "\ISO\Genre" -> parent + leaf */
+    int k = n - 2;
+    while (k >= 0 && q.dir[k] != '\\') k--;
+    fp_wcsncpy(q.leaf, q.dir + k + 1, 0x100);
+    q.dir[k + 1] = 0;
+    if (es_vdir(c, &q, 0) < 0) return FAT_ENOENT;
+    DirHandle *d = (DirHandle *)fatfs_get_scratch(c);
+    if (!d) return FAT_ENOMEM;
+    memset(d, 0, sizeof(*d));
+    d->is_dir = 1; d->ctx = c;
+    d->path.dir[0] = '\\'; d->path.leaf[0] = '*';
+    es_dir_init(c, d, p, 1);
+    *out = d;
     return 0;
 }
 
-void es_save_dirname(int fd, const char *dirname)
+/* the overlay: next ES file in the directory, then each subdirectory only ES names have (once,
+   and not when the filesystem has it). 0 = an entry, FAT_ENOENT = the end. */
+int es_dread(fatms_ctx *c, DirHandle *d, SceIoDirent *de, void *priv)
 {
-    if (fd < 0 || fd >= 16) return;
-    const char *dp = dirname;
-    while (*dp == '/') dp++;
-    int dlen = 0;
-    while (dp[dlen] && dlen < 255) dlen++;
-    memcpy(es_dir_paths[fd], dp, dlen);
-    if (dlen > 0 && es_dir_paths[fd][dlen - 1] == '/') dlen--;
-    es_dir_paths[fd][dlen] = '\0';
-}
-
-// case-insensitive compare of up to dlen bytes; returns 1 if equal
-static int es_prefix_iequal(const char *a, const char *b, int dlen)
-{
-    int j;
-    for (j = 0; j < dlen; j++) {
-        char ca = a[j], cb = b[j];
-        if (ca >= 'A' && ca <= 'Z') ca += 32;
-        if (cb >= 'A' && cb <= 'Z') cb += 32;
-        if (ca != cb) return 0;
-    }
-    return 1;
-}
-
-// !NOTE: out must have room for at least 256 bytes.
-static int es_extract_subdir(const char *fn, const char *opened_dir, int opened_len, char *out)
-{
-    int skip;
-    if (opened_len == 0) {
-        skip = 0;
-    } else {
-        if (!es_prefix_iequal(fn, opened_dir, opened_len)) return 0;
-        if (fn[opened_len] != '/') return 0;
-        skip = opened_len + 1;
-    }
-
-    // find next '/' after skip. no next slash means it's a direct file, not a subdir.
-    int i = 0;
-    while (fn[skip + i] && fn[skip + i] != '/') {
-        if (i >= 255) return 0;
-        out[i] = fn[skip + i];
-        i++;
-    }
-    if (fn[skip + i] != '/') return 0;
-    out[i] = '\0';
-    return i;
-}
-
-int es_dread_overlay(int fd, SceIoDirent *dir, int *iter)
-{
-    if (!es_initialized || es_iso_count <= 0) return 0;
-    if (fd < 0 || fd >= 16) return 0;
-    if (!iter) return 0;
-
-    const char *opened_dir = es_dir_paths[fd];
-    int opened_len = 0;
-    while (opened_dir[opened_len]) opened_len++;
-
-    // two-phase iterator:
-    //   phase 1 (bit 31 clear): scan for files whose dir_part == opened_dir
-    //   phase 2 (bit 31 set):   synthesize unique immediate subdirectory names
-    // bits 0..30 hold the current table index within the phase.
-    // ... maybe strike that - reverse it
-    unsigned int raw = (unsigned int)*iter;
-    int phase2 = (raw & 0x80000000u) ? 1 : 0;
-    int idx = (int)(raw & 0x7FFFFFFFu);
-
-    if (!phase2) {
-        // ── phase 1: direct file matches ──
-        while (idx < es_iso_count) {
-            int cur = idx++;
-
-            if (!(es_table[cur].flags & ES_FLAG_ACTIVE)) continue;
-            if (es_table[cur].name_len == 0) continue;
-
-            // extract directory and basename from the name pool entry.
-            // filenames look like "ISO/game.iso" or "ISO/Genre/game.iso".
-            const char *fn = es_get_name(cur);
-            const char *last_slash = 0;
-            const char *p;
-            for (p = fn; *p; p++) {
-                if (*p == '/') last_slash = p;
+    es_dh *h = ESDH(d);
+    if (h->magic != ES_DHMAGIC || !on(c)) return FAT_ENOENT;
+    u16 *w = (u16 *)fatfs_get_scratch(c), *v = (u16 *)fatfs_get_scratch(c);
+    if (!w || !v) { if (w) fatfs_put_scratch(c, w); if (v) fatfs_put_scratch(c, v); return FAT_ENOMEM; }
+    int dl = fp_wcslen(h->dir), r = FAT_ENOENT;
+    for (; h->phase < 2; h->phase++, h->idx = 0) {
+        for (; h->idx < E.n; h->idx++) {
+            u32 i = h->idx;
+            if (!(E.e[i].flags & ES_FLAG_ACTIVE)) continue;
+            es_name(i, w);
+            if (fp_wcslen(w) <= dl || !same(w, h->dir, dl)) continue;
+            u16 *rest = w + dl, *sl = rest;
+            while (*sl && *sl != '\\') sl++;
+            if (h->phase == 0 && *sl) continue;                          /* files directly in the directory */
+            if (h->phase == 1) {                                         /* subdirectories only ES has */
+                if (!*sl) continue;
+                *sl = 0;
+                int sn = (int)(sl - rest), dup = 0;
+                for (u32 k = 0; k < i && !dup; k++) {                    /* emitted for an earlier entry? */
+                    if (!(E.e[k].flags & ES_FLAG_ACTIVE)) continue;
+                    es_name(k, v);
+                    dup = fp_wcslen(v) > dl + sn && same(v, h->dir, dl) && same(v + dl, rest, sn) && v[dl + sn] == '\\';
+                }
+                if (dup) continue;
+                fpath *q = (fpath *)v;                                   /* v is free again: reuse it */
+                fp_wcsncpy(q->dir, h->dir, 0x104);
+                fp_wcsncpy(q->leaf, rest, 0x100);
+                SceIoStat st;
+                if (fatfs_getstat(c, q, &st) == 0) continue;             /* the filesystem has it */
             }
-
-            const char *base_name;
-            char dir_part[256];
-            if (last_slash) {
-                int dlen = (int)(last_slash - fn);
-                if (dlen > 255) dlen = 255;
-                int di;
-                for (di = 0; di < dlen; di++) dir_part[di] = fn[di];
-                dir_part[dlen] = '\0';
-                base_name = last_slash + 1;
-            } else {
-                dir_part[0] = '\0';
-                base_name = fn;
-            }
-
-            const char *a = opened_dir;
-            const char *b = dir_part;
-            int match = 1;
-            while (*a && *b) {
-                char ca = *a, cb = *b;
-                if (ca >= 'a' && ca <= 'z') ca -= 32;
-                if (cb >= 'a' && cb <= 'z') cb -= 32;
-                if (ca != cb) { match = 0; break; }
-                a++; b++;
-            }
-            if (*a || *b) match = 0;
-
-            if (!match) continue;
-
-            memset(dir, 0, sizeof(SceIoDirent));
-            int ni;
-            for (ni = 0; base_name[ni] && ni < 255; ni++)
-                dir->d_name[ni] = base_name[ni];
-            dir->d_name[ni] = '\0';
-
-            dir->d_stat.st_size = es_table[cur].size_lo;
-            dir->d_stat.st_mode = 0x21FF; // regular file
-            dir->d_stat.st_attr = 0x20;   // archive
-            // magic dates!!
-            dir->d_stat.sce_st_ctime.year = 1992; dir->d_stat.sce_st_ctime.month = 3; dir->d_stat.sce_st_ctime.day = 27;
-            dir->d_stat.sce_st_mtime.year = 1992; dir->d_stat.sce_st_mtime.month = 3; dir->d_stat.sce_st_mtime.day = 27;
-            dir->d_stat.sce_st_atime.year = 1992; dir->d_stat.sce_st_atime.month = 3; dir->d_stat.sce_st_atime.day = 27;
-
-            *iter = (int)((unsigned int)idx & 0x7FFFFFFFu);
-            return 1;
-        }
-        // phase 1 exhausted - transition to phase 2
-        phase2 = 1;
-        idx = 0;
-    }
-
-    // let's try to help GCLite better...
-    // for each entry whose filename is "opened_dir/<sub>/..." emit <sub> once,
-    // deduping against earlier entries at indices 0..cur-1.
-    while (idx < es_iso_count) {
-        int cur = idx++;
-        if (!(es_table[cur].flags & ES_FLAG_ACTIVE)) continue;
-        if (es_table[cur].name_len == 0) continue;
-
-        char sub_name[256];
-        int slen = es_extract_subdir(es_get_name(cur), opened_dir,
-                                      opened_len, sub_name);
-        if (slen <= 0) continue;
-
-        // dedupe: skip if any earlier active entry yields the same sub_name
-        int dup = 0;
-        int k;
-        for (k = 0; k < cur; k++) {
-            if (!(es_table[k].flags & ES_FLAG_ACTIVE)) continue;
-            if (es_table[k].name_len == 0) continue;
-            char prev[256];
-            int plen = es_extract_subdir(es_get_name(k), opened_dir,
-                                          opened_len, prev);
-            if (plen != slen) continue;
-            int eq = 1, m;
-            for (m = 0; m < slen; m++) {
-                char ca = prev[m], cb = sub_name[m];
-                if (ca >= 'A' && ca <= 'Z') ca += 32;
-                if (cb >= 'A' && cb <= 'Z') cb += 32;
-                if (ca != cb) { eq = 0; break; }
-            }
-            if (eq) { dup = 1; break; }
-        }
-        if (dup) continue;
-
-        memset(dir, 0, sizeof(SceIoDirent));
-        int ni;
-        for (ni = 0; ni < slen && ni < 255; ni++)
-            dir->d_name[ni] = sub_name[ni];
-        dir->d_name[ni] = '\0';
-
-        dir->d_stat.st_size = 0;
-        dir->d_stat.st_mode = 0x11FF; // directory
-        dir->d_stat.st_attr = 0x10;   // FAT directory attribute
-        dir->d_stat.sce_st_ctime.year = 1992; dir->d_stat.sce_st_ctime.month = 3; dir->d_stat.sce_st_ctime.day = 27;
-        dir->d_stat.sce_st_mtime.year = 1992; dir->d_stat.sce_st_mtime.month = 3; dir->d_stat.sce_st_mtime.day = 27;
-        dir->d_stat.sce_st_atime.year = 1992; dir->d_stat.sce_st_atime.month = 3; dir->d_stat.sce_st_atime.day = 27;
-
-        *iter = (int)(0x80000000u | ((unsigned int)idx & 0x7FFFFFFFu));
-        return 1;
-    }
-
-    // both phases done - leave iter in a terminal state so later calls still return 0
-    *iter = (int)(0x80000000u | (unsigned int)es_iso_count);
-    return 0;
-}
-
-unsigned int es_mbr_find(const unsigned char *mbr_buf, unsigned int *out_num_sectors)
-{
-    if (mbr_buf[510] != 0x55 || mbr_buf[511] != 0xAA) return 0;
-    typedef struct {
-        unsigned char status; unsigned char chs_first[3];
-        unsigned char type; unsigned char chs_last[3];
-        unsigned int lba_start; unsigned int num_sectors;
-    } __attribute__((packed)) MBREntry;
-    const MBREntry *entries = (const MBREntry *)(mbr_buf + 0x1BE);
-    int i;
-    for (i = 0; i < 4; i++) {
-        if (entries[i].type == ES_PARTITION_TYPE && entries[i].lba_start > 0) {
-            if (out_num_sectors) *out_num_sectors = entries[i].num_sectors;
-            return entries[i].lba_start;
+            if (fp_wildmatch(d->path.leaf, rest, 0) != 0) continue;
+            u8 ent[32];
+            es_entry32(ent, h->phase ? 0x10 : 0x20, h->phase ? 0 : E.e[i].size);
+            r = dread_emit(c, de, priv, ent, rest, "");
+            if (r < 0) goto out;
+            h->idx++;
+            r = 0;
+            goto out;
         }
     }
-    return 0;
+out:
+    fatfs_put_scratch(c, v);
+    fatfs_put_scratch(c, w);
+    return r;
 }
 
-int es_init_partition(unsigned int partition_start)
+/* ---------------- devctls for the ES app ---------------- */
+static int es_raw(fatms_ctx *c, int write, void *in, int inlen)
 {
-    es_initialized = 0;
-    es_iso_count = 0;
-    // invalidate the cached fd on reinit other wise the stale fd prevents games from running
-    // the controller doesn't handle this with sony's default setup right?
-    es_cached_blk_fd = -1;
-    es_cached_pos = 0xFFFFFFFFFFFFFFFFULL;
-    es_data_start_sec = 0;
-    es_partition_start = partition_start;
-
-    if (partition_start == 0) return -1;
-
-    unsigned char sb[512] __attribute__((aligned(64)));
-    int r = es_read_abs(partition_start, sb, 1);
-    if (r < 0) return -2;
-
-    const ExtremeSpeedSuperblock *super = (const ExtremeSpeedSuperblock *)sb;
-    if (super->magic != ES_MAGIC || super->version != ES_VERSION) return -3;
-
-    es_data_start_sec = super->data_start_sector;
-    int count = (int)super->iso_count;
-    if (count > ES_MAX_ISOS) count = ES_MAX_ISOS;
-
-    if (count > 0) {
-        unsigned char buf[512] __attribute__((aligned(64)));
-        int sectors_needed = (count + ES_ENTRIES_PER_SECTOR - 1) / ES_ENTRIES_PER_SECTOR;
-        int s;
-        for (s = 0; s < sectors_needed; s++) {
-            r = es_read_abs(partition_start + 1 + s, buf, 1);
-            if (r < 0) return -4;
-            int base = s * ES_ENTRIES_PER_SECTOR;
-            int n = count - base;
-            if (n > ES_ENTRIES_PER_SECTOR) n = ES_ENTRIES_PER_SECTOR;
-            int i;
-            for (i = 0; i < n; i++) {
-                memcpy(&es_table[base + i],
-                       buf + i * ES_ENTRY_SIZE,
-                       ES_ENTRY_SIZE);
-            }
+    if (!in || inlen < 12) return FAT_EINVAL;
+    u32 sector = ((u32 *)in)[0], count = ((u32 *)in)[1];
+    u8 *buf = ((u8 **)in)[2];
+    if (!buf || count == 0 || count > 0x10000) return FAT_EINVAL;
+    if ((int)(fat_k1() & ((u32)buf | ((u32)buf + count * 512 - 1))) < 0) return FAT_EINVAL;   /* user caller, kernel buffer */
+    SceUID fd = k_sceIoOpen(c->name_msstor0, write ? 0x4000003 : 0x4000001, 0);
+    if (fd < 0) return fd;
+    SceOff s = k_sceIoLseek64k(fd, (SceOff)sector * 512, 0);             /* 64-bit: never cast the offset */
+    int r = s < 0 ? (int)s : 0;
+    for (u32 done = 0; r >= 0 && done < count; ) {
+        u32 k = count - done, aligned = !((u32)(buf + done * 512) & 63);
+        if (!aligned && k > 16) k = 16;
+        u8 *p = aligned ? buf + done * 512 : E.bounce;
+        if (write && !aligned) memcpy(p, buf + done * 512, k * 512);
+        if (write) sceKernelDcacheWritebackInvalidateRange(p, k * 512);
+        r = write ? k_sceIoWrite(fd, p, (int)(k * 512)) : k_sceIoRead(fd, p, (int)(k * 512));
+        if (r >= 0 && !write) {
+            sceKernelDcacheWritebackInvalidateRange(p, k * 512);
+            if (!aligned) memcpy(buf + done * 512, p, k * 512);
         }
+        done += k;
     }
-
-    {
-        memset(es_name_pool, 0, sizeof(es_name_pool));
-        int s;
-        for (s = 0; s < ES_NAME_POOL_SECTORS; s++) {
-            r = es_read_abs(partition_start + ES_NAME_POOL_START_SECTOR + s,
-                            &es_name_pool[s * ES_SECTOR_SIZE], 1);
-            if (r < 0) return -5;
-        }
-        // force the very last byte to 0 so a malformed entry whose name_off+name_len lands at the end still reads as terminated
-        es_name_pool[ES_NAME_POOL_BYTES - 1] = 0;
-    }
-
-    es_iso_count = count;
-    es_initialized = 1;
-    return 0;
+    k_sceIoClose(fd);
+    return r < 0 ? r : 0;
 }
 
-int es_devctl_read_sector(void *indata, int inlen)
+int es_devctl(fatms_ctx *c, unsigned int cmd, void *in, int inlen, void *out, int outlen)
 {
-    if (!indata || inlen < (int)sizeof(ExtremeSpeedDevCtlArg)) return 0x80010016;
-    const ExtremeSpeedDevCtlArg *a = (const ExtremeSpeedDevCtlArg *)indata;
-    if (!a->buffer || a->count == 0) return 0x80010016;
-    return es_read_abs(a->sector, a->buffer, a->count);
-}
-
-int es_devctl_write_sector(void *indata, int inlen)
-{
-    if (!indata || inlen < (int)sizeof(ExtremeSpeedDevCtlArg)) return 0x80010016;
-    const ExtremeSpeedDevCtlArg *a = (const ExtremeSpeedDevCtlArg *)indata;
-    if (!a->buffer || a->count == 0) return 0x80010016;
-    return es_write_abs(a->sector, a->buffer, a->count);
-}
-
-int es_devctl_get_info(void *outdata, int outlen)
-{
-    if (!outdata || outlen < (int)sizeof(ExtremeSpeedInfo)) return 0x80010016;
-    ExtremeSpeedInfo *info = (ExtremeSpeedInfo *)outdata;
-    info->initialized = es_initialized;
-    info->partition_start_sector = es_partition_start;
-    info->total_sectors = 0;
-    info->iso_count = (unsigned int)es_iso_count;
-    info->data_start_sector = es_data_start_sec;
-    info->free_sector = es_next_free();
-    if (es_initialized && es_partition_start > 0) {
-        unsigned char sb[512] __attribute__((aligned(64)));
-        if (es_read_abs(es_partition_start, sb, 1) >= 0) {
-            const ExtremeSpeedSuperblock *s = (const ExtremeSpeedSuperblock *)sb;
-            if (s->magic == ES_MAGIC) info->total_sectors = s->total_sectors;
-        }
+    int r = fatfs_prep(c);
+    if (r >= 0) r = fatfs_ready(c);
+    switch (cmd) {
+    case ES_DEVCTL_READ_SECTOR:  return es_raw(c, 0, in, inlen);
+    case ES_DEVCTL_WRITE_SECTOR: return es_raw(c, 1, in, inlen);
+    case ES_DEVCTL_GET_INFO: {
+        if (!out || outlen < (int)sizeof(ExtremeSpeedInfo)) return FAT_EINVAL;
+        ExtremeSpeedInfo *o = (ExtremeSpeedInfo *)out;
+        u32 next = E.data_start;
+        for (u32 i = 0; E.on && i < E.n; i++)
+            if ((E.e[i].flags & ES_FLAG_ACTIVE) && E.e[i].start + (E.e[i].size + 511) / 512 > next)
+                next = E.e[i].start + (E.e[i].size + 511) / 512;
+        o->initialized = (u32)E.on;
+        o->partition_start_sector = E.on ? E.lba : 0;
+        o->total_sectors = E.on ? E.total : 0;
+        o->iso_count = E.on ? E.n : 0;
+        o->data_start_sector = E.on ? E.data_start : 0;
+        o->free_sector = E.on ? next : 0;
+        return 0;
     }
-    return 0;
-}
-
-int es_devctl_rescan(void)
-{
-    unsigned char mbr[512] __attribute__((aligned(64)));
-    if (es_read_abs(0, mbr, 1) < 0) {
-        es_initialized = 0;
-        es_iso_count = 0;
-        return -1;
+    case ES_DEVCTL_RESCAN:                                               /* the app changed the MBR / ES / VBR */
+        if (r < 0) return r;
+        if ((r = fatfs_flush(c)) < 0) return r;
+        msstor_cap_insert(c);                                            /* MBR again: size, ES partition */
+        c->media_flags |= MF_INSERTED;                                   /* re-identify: FS caches dropped */
+        if ((r = fatfs_prep(c)) < 0) return r;                           /* ... and ES reloaded, now */
+        return 0;
+    case ES_DEVCTL_SYNC_FD:      return 0;
+    case ES_DEVCTL_GET_VERSION:
+        if (!out || outlen < 4) return FAT_EINVAL;
+        *(u32 *)out = DRATINIFS_VERSION;
+        return 0;
+    case ES_DEVCTL_FORMAT:                                               /* 0 FAT32, 1 exFAT (format.c) */
+        if (!in || inlen < 4) return FAT_EINVAL;
+        r = dfs_format(c, *(int *)in == 1);
+        return r > 0 ? 0 : r;
     }
-    unsigned int ns = 0;
-    unsigned int lba = es_mbr_find(mbr, &ns);
-    return es_init_partition(lba);
+    return FAT_EUNSUP;
 }

@@ -1,0 +1,3 @@
+# tests run inside a Linux container: shell scripts and goldens must stay LF
+*.sh text eol=lf
+tests/** text eol=lf

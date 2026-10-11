@@ -1,0 +1,18 @@
+PSP_BEGIN_EXPORTS
+
+# Sony 6.61 fatmsef (PSP Go) syslib: module_start, module_reboot_phase, module_info, module_sdk_version
+PSP_EXPORT_START(syslib, 0, 0x8000)
+PSP_EXPORT_FUNC_NID(module_start, 0xD632ACDB)
+PSP_EXPORT_FUNC_NID(module_reboot_phase, 0xADF12745)
+PSP_EXPORT_VAR_NID(module_info, 0xF01D73A7)
+PSP_EXPORT_VAR_NID(module_sdk_version, 0x11B97506)
+PSP_EXPORT_END
+
+# internal storage for XMB (vshbridge): format, open after USB mode, close before it (src/fatfs_ef.c)
+PSP_EXPORT_START(sceFatfs_driver, 0x0011, 0x0001)
+PSP_EXPORT_FUNC_NID(sceFatfs_driver_3991C1A9, 0x3991C1A9)
+PSP_EXPORT_FUNC_NID(sceFatfs_driver_5DEB8124, 0x5DEB8124)
+PSP_EXPORT_FUNC_NID(sceFatfs_driver_C8537E11, 0xC8537E11)
+PSP_EXPORT_END
+
+PSP_END_EXPORTS

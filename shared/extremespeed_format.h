@@ -61,8 +61,8 @@
 #define ES_FLAG_FROM_UNALLOCATED 0x01  // Partition created from unallocated space (don't expand FS on delete)
 
 // dratinifs version - bump this when releasing new builds
-#define DRATINIFS_VERSION_MAJOR 1
-#define DRATINIFS_VERSION_MINOR 4
+#define DRATINIFS_VERSION_MAJOR 2
+#define DRATINIFS_VERSION_MINOR 0
 #define DRATINIFS_VERSION ((DRATINIFS_VERSION_MAJOR << 8) | DRATINIFS_VERSION_MINOR)
 
 // devctl command codes (homebrew -> dratinifs driver)
