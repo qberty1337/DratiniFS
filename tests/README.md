@@ -52,6 +52,13 @@ Then the DratiniFS features:
 - **es on fat32 / exfat**: an ES v3 partition after the FS partition, past the adapter's reported size: ES files
   (any case, unaligned reads, past-EOF reads), ES-first reads, writes only to the FS, the listing overlay, ES-only
   directories, remove (FS copy first, then the ES entry, persisted), the 0x041000xx devctls (k1-checked buffers).
+- **exfat big files**: a 16 GB sparse exFAT volume whose contiguous files past 4 GB are laid out by
+  `host/exfat_bigfile.py` (no gigabytes written). The driver must report the true 64-bit size in getstat and
+  listings, read and write across the 4 GB line, keep the size through chstat, rename and move, append past 5 GiB
+  (chaining the file), zero-fill a gap written past the end, and free every cluster on remove and truncate.
+  `fsck.exfat` must pass before and after, and fuse-exfat must read back the size and the bytes the driver wrote.
+  On exFAT the scenarios run with `FST_LARGE`: a seek past 4 GB succeeds (FAT's limit, not exFAT's) and a gap
+  written past the end reads as zeros (exFAT's ValidDataLength). The PSP EBOOT sets it when ms0: is exFAT.
 - **short FAT**: a FAT32 whose data area has more clusters than its FAT holds (the old ES PC tool's format). The
   driver must cap the cluster count at the FAT's size; before that, XMB's free-space scan hung at boot.
 

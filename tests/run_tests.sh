@@ -6,4 +6,4 @@
 cd "$(dirname "$0")/.." || exit 1
 here=$(pwd -W 2>/dev/null || pwd)
 MSYS_NO_PATHCONV=1 docker run --rm --privileged --platform linux/386 -e FST_FSCK_EACH -v "$here:/src" -w /src/tests alpine:3.20 \
-    sh -c "apk add --no-cache gcc musl-dev dosfstools mtools exfatprogs fuse-exfat >/dev/null && sh run_host.sh $*"
+    sh -c "apk add --no-cache gcc musl-dev dosfstools mtools exfatprogs fuse-exfat python3 >/dev/null && sh run_host.sh $*"

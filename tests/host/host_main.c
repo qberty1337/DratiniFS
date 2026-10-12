@@ -7,6 +7,7 @@
  *   fstest_host es <disk> <out.img> <seed dir> <attr>                 ExtremeSpeed partition
  *   fstest_host format <disk> <out prefix> <seed dir|-> [attr]       formatting (<out>.0..3.img)
  *   fstest_host walk <disk> -                                         list/stat/read everything (a dumped card)
+ *   fstest_host exbig <disk> -                                        exFAT files past 4 GB (exfat_bigfile.py)
  * PSP Go build (fstest_host_go, -DPSPGO): ms0: + ef0: + eh0: (go_main below)
  *   fstest_host_go go|goformat|goformat16|goemu|goemu-nomsemu <ms disk> <out> <ef image> <eh image>
  * Exit status 0 = every check passed. */
@@ -21,6 +22,7 @@
 int module_reboot_phase(int phase, void *param, int a3, int a4);
 
 static fst_result R;
+#define FL (g_ctx.exfat ? FST_LARGE : 0)                 /* exFAT: files may pass 4 GB */
 static const char *G = "host";
 #define HCHECK(c) do { if (c) R.pass++; else { R.fail++; printf("  FAIL %s:%d  %s\n", G, __LINE__, #c); } } while (0)
 #define HEQ(a, b) do { long long _a = (long long)(a), _b = (long long)(b); if (_a == _b) R.pass++; else { R.fail++; \
@@ -430,7 +432,7 @@ static void format_tests(const char *dir, const char *out)
         HEQ(fst_write_file("ms0:/FMT.BIN", 700 + (u32)i, 3 * cluster_bytes() + 77), 0);
         HEQ(fst_verify_file("ms0:/FMT.BIN", 700 + (u32)i, 3 * cluster_bytes() + 77), 0);
         if (i == 0 || i == 2) {                              /* the new filesystem passes the whole suite */
-            fst_run("ms0:/FATMSTEST", FST_DETERMINISTIC, &R);
+            fst_run("ms0:/FATMSTEST", FST_DETERMINISTIC | FL, &R);
         }
         HEQ(host_eject(), 0);
         snprintf(path, sizeof path, "%s.%d.img", out, i);
@@ -471,6 +473,130 @@ static void walk(const char *path, int depth)
     fs_dclose(fd);
     for (int i = 0; i < n; i++) { snprintf(c, sizeof c, "%s/%s", path, kids[i]); walk(c, depth + 1); }
     free(kids);
+}
+
+/* ---------------- exFAT files past 4 GB (exfat_bigfile.py made BIG.BIN, BIG3.BIN, BIG4.BIN) ----------------
+ * The script's markers: 8 bytes (n << 56 | offset) at 0, 4 GB - 8, 4 GB, 4 GB + cluster + 3, size - 8.
+ * What this writes, run_host.sh checks again through fuse-exfat: CROSS16 at 4 GB - 8, APPEND bytes
+ * (i * 7 + 3) from S1 on, then a zero gap and TAIL10. */
+#define G4 0x100000000LL
+static const s64 S1 = 5 * (G4 / 4) + 12345, S3 = G4 + 777, S4 = G4 + 5;   /* 5 GiB + 12345 etc.: the sizes run_host.sh gives the script */
+#define APPEND 100000
+#define GAP    50000
+static const char CROSS16[] = "CROSS-4GB-OK!!!!", TAIL10[] = "END-MARKER";
+static u64 mark(u32 n, s64 off) { return (u64)n << 56 | (u64)off; }
+static int read_at(int fd, s64 off, void *b, int n) { return fs_lseek(fd, off, PSP_SEEK_SET) == off ? fs_read(fd, b, n) : -1; }
+static int mark_ok(int fd, u32 n, s64 off) { u64 v = 0; return read_at(fd, off, &v, 8) == 8 && v == mark(n, off); }
+static s64 st_size(const char *p) { SceIoStat st; memset(&st, 0, sizeof st); return fs_getstat(p, &st) < 0 ? -1 : st.st_size; }
+static s64 listed_size(const char *dir, const char *name)       /* the size dread reports */
+{
+    SceIoDirent d;
+    s64 got = -1;
+    int fd = fs_dopen(dir);
+    if (fd < 0) return -2;
+    while (memset(&d, 0, sizeof d), fs_dread(fd, &d) > 0) if (!strcmp(d.d_name, name)) got = d.d_stat.st_size;
+    fs_dclose(fd);
+    return got;
+}
+static void exbig_tests(void)
+{
+    static u8 buf[APPEND];
+    u8 b[64];
+    u32 cb = cluster_bytes();
+    section("exfat big: stat and listing");
+    HEQ(st_size("ms0:/BIG.BIN"), S1);
+    HEQ(listed_size("ms0:/", "BIG.BIN"), S1);
+    HEQ(listed_size("ms0:/", "BIG3.BIN"), S3);
+
+    section("exfat big: read past 4 GB (contiguous file)");
+    int fd = fs_open("ms0:/BIG.BIN", PSP_O_RDONLY, 0);
+    HCHECK(fd >= 0);
+    HEQ(fs_lseek(fd, 0, PSP_SEEK_END), S1);
+    HEQ(fs_lseek(fd, 0, PSP_SEEK_CUR), S1);
+    HEQ(fs_read(fd, b, 8), 0);                                       /* at the end */
+    HCHECK(mark_ok(fd, 1, 0) && mark_ok(fd, 1, G4 - 8) && mark_ok(fd, 1, G4) && mark_ok(fd, 1, G4 + cb + 3) && mark_ok(fd, 1, S1 - 8));
+    u64 lo = mark(1, G4 - 8), hi = mark(1, G4);
+    HEQ(read_at(fd, G4 - 4, b, 8), 8);                               /* one read across the 4 GB line */
+    HCHECK(!memcmp(b, (u8 *)&lo + 4, 4) && !memcmp(b + 4, &hi, 4));
+    HEQ(read_at(fd, S1 - 4, b, 8), 4);                               /* short read at the end */
+    HEQ(fs_lseek(fd, G4 + 1, PSP_SEEK_SET), G4 + 1);
+    HEQ(fs_lseek(fd, -2, PSP_SEEK_CUR), G4 - 1);
+    HEQ(fs_lseek(fd, -(S1 + 1), PSP_SEEK_END), E_EINVAL);           /* before 0 */
+    HEQ(fs_lseek(fd, 0, PSP_SEEK_CUR), G4 - 1);
+    HEQ(fs_lseek(fd, 3 * G4, PSP_SEEK_SET), 3 * G4);
+    HEQ(fs_ioctl(fd, 0x0242D016, 0, 0, 0, 0), 0);                    /* "at EOF?" below the end: no */
+    HEQ(fs_lseek(fd, 0, PSP_SEEK_END), S1);
+    HCHECK(fs_ioctl(fd, 0x0242D016, 0, 0, 0, 0) >= 0);
+    fs_close(fd);
+
+    section("exfat big: write across 4 GB");
+    fd = fs_open("ms0:/BIG.BIN", PSP_O_RDWR, 0);
+    HCHECK(fd >= 0);
+    HEQ(fs_lseek(fd, G4 - 8, PSP_SEEK_SET), G4 - 8);
+    HEQ(fs_write(fd, CROSS16, 16), 16);
+    HEQ(fs_lseek(fd, 0, PSP_SEEK_CUR), G4 + 8);
+    fs_close(fd);
+    HEQ(st_size("ms0:/BIG.BIN"), S1);                                /* close keeps the 64-bit size */
+    fd = fs_open("ms0:/BIG.BIN", PSP_O_RDONLY, 0);
+    HCHECK(read_at(fd, G4 - 8, b, 16) == 16 && !memcmp(b, CROSS16, 16));
+    HCHECK(mark_ok(fd, 1, G4 + cb + 3) && mark_ok(fd, 1, S1 - 8));
+    fs_close(fd);
+
+    section("exfat big: chstat, rename and move keep the size");
+    SceIoStat st;
+    memset(&st, 0, sizeof st);
+    st.sce_st_mtime.year = 2020; st.sce_st_mtime.month = 1; st.sce_st_mtime.day = 2;
+    HEQ(fs_chstat("ms0:/BIG.BIN", &st, 0x20), 0);
+    HEQ(st_size("ms0:/BIG.BIN"), S1);
+    HEQ(fs_rename("ms0:/BIG.BIN", "ms0:/Big Video.mp4"), 0);
+    HEQ(st_size("ms0:/Big Video.mp4"), S1);
+    HEQ(fs_mkdir("ms0:/VID", 0777), 0);
+    const char *mv[2] = { "/Big Video.mp4", "/VID/Big Video.mp4" };
+    HEQ(fs_devctl("ms0:", 0x02415830, mv, 8, 0, 0), 0);
+    HEQ(st_size("ms0:/VID/Big Video.mp4"), S1);
+    HEQ(listed_size("ms0:/VID", "Big Video.mp4"), S1);
+
+    section("exfat big: append past 5 GiB (the file gets a FAT chain)");
+    for (u32 i = 0; i < APPEND; i++) buf[i] = (u8)(i * 7 + 3);
+    fd = fs_open("ms0:/VID/Big Video.mp4", PSP_O_WRONLY | PSP_O_APPEND, 0);
+    HCHECK(fd >= 0);
+    HEQ(fs_write(fd, buf, APPEND), APPEND);
+    HEQ(fs_lseek(fd, 0, PSP_SEEK_CUR), S1 + APPEND);
+    fs_close(fd);
+    HEQ(st_size("ms0:/VID/Big Video.mp4"), S1 + APPEND);
+    fd = fs_open("ms0:/VID/Big Video.mp4", PSP_O_RDONLY, 0);
+    HCHECK(mark_ok(fd, 1, S1 - 8) && mark_ok(fd, 1, 0) && mark_ok(fd, 1, G4 + cb + 3));   /* through the chain, jumping */
+    HCHECK(read_at(fd, G4 - 8, b, 16) == 16 && !memcmp(b, CROSS16, 16));
+    static u8 chk[APPEND];
+    HEQ(read_at(fd, S1, chk, APPEND), APPEND);
+    HCHECK(!memcmp(chk, buf, APPEND));
+    fs_close(fd);
+
+    section("exfat big: a write past the end zero-fills the gap");
+    fd = fs_open("ms0:/VID/Big Video.mp4", PSP_O_RDWR, 0);
+    HEQ(fs_lseek(fd, S1 + APPEND + GAP, PSP_SEEK_SET), S1 + APPEND + GAP);
+    HEQ(fs_write(fd, TAIL10, 10), 10);
+    fs_close(fd);
+    HEQ(st_size("ms0:/VID/Big Video.mp4"), S1 + APPEND + GAP + 10);
+    fd = fs_open("ms0:/VID/Big Video.mp4", PSP_O_RDONLY, 0);
+    memset(chk, 0xee, GAP);
+    HEQ(read_at(fd, S1 + APPEND, chk, GAP), GAP);
+    int zero = 1;
+    for (u32 i = 0; i < GAP; i++) zero &= chk[i] == 0;
+    HCHECK(zero);
+    HCHECK(read_at(fd, S1 + APPEND + GAP, b, 16) == 10 && !memcmp(b, TAIL10, 10));
+    fs_close(fd);
+
+    section("exfat big: remove and truncate free every cluster");
+    u32 f0 = free_clusters();
+    HEQ(fs_remove("ms0:/BIG3.BIN"), 0);
+    HEQ(free_clusters(), f0 + (u32)((S3 + cb - 1) / cb));
+    fd = fs_open("ms0:/BIG4.BIN", PSP_O_WRONLY | PSP_O_TRUNC, 0);
+    HCHECK(fd >= 0);
+    fs_close(fd);
+    HEQ(st_size("ms0:/BIG4.BIN"), 0);
+    HEQ(free_clusters(), f0 + (u32)((S3 + cb - 1) / cb) + (u32)((S4 + cb - 1) / cb));
+    HEQ(fs_remove("ms0:/BIG4.BIN"), 0);
 }
 
 /* files left on the card for mtools to read back (tests/run_host.sh) */
@@ -914,9 +1040,9 @@ int main(int argc, char **argv)
     check_boot();
     if (!strcmp(mode, "golden")) {
         host_sdk = 0x06060110;
-        fst_run("ms0:/FATMSTEST", FST_DETERMINISTIC | FST_BIG | FST_KEEP, &R);
+        fst_run("ms0:/FATMSTEST", FST_DETERMINISTIC | FST_BIG | FST_KEEP | FL, &R);
         host_sdk = 0x03070110;
-        fst_run("ms0:/FATMSTEST", FST_DETERMINISTIC | FST_NAMES_ONLY, &R);
+        fst_run("ms0:/FATMSTEST", FST_DETERMINISTIC | FST_NAMES_ONLY | FL, &R);
         HEQ(host_eject(), 0);
         HEQ(host_disk_save(out), 0);
         printf("IO %u %u %u %u\n", host_rd_calls, host_rd_sectors, host_wr_calls, host_wr_sectors);
@@ -924,9 +1050,9 @@ int main(int argc, char **argv)
         check_kernel_hooks();
         if (argc > 4) check_seeds(argv[4]);
         host_sdk = 0x06060110;
-        fst_run("ms0:/FATMSTEST", FST_BIG | FST_KEEP, &R);
+        fst_run("ms0:/FATMSTEST", FST_BIG | FST_KEEP | FL, &R);
         host_sdk = 0x03070110;
-        fst_run("ms0:/FATMSTEST", FST_NAMES_ONLY | FST_KEEP, &R);
+        fst_run("ms0:/FATMSTEST", FST_NAMES_ONLY | FST_KEEP | FL, &R);
         host_sdk = 0x06060110;
         check_host_only();
         if (g_ctx.exfat && argc > 4) exfat_extras();             /* needs the fuse-exfat seeds */
@@ -950,6 +1076,9 @@ int main(int argc, char **argv)
         es_tests(argv[4]);
         HEQ(host_eject(), 0);
         if (strcmp(out, "-")) HEQ(host_disk_save(out), 0);           /* "-": the card itself is the result */
+    } else if (!strcmp(mode, "exbig")) {                             /* exFAT files past 4 GB */
+        exbig_tests();
+        HEQ(host_eject(), 0);
     } else if (!strcmp(mode, "walk")) {                              /* a dumped real card: <out> unused */
         u32 o[5] = { 0 }, *p = o, es[6] = { 0 };
         HEQ(fs_devctl("ms0:", 0x02425818, &p, 4, 0, 0), 0);

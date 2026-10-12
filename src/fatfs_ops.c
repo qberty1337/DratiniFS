@@ -174,6 +174,7 @@ int fatfs_lseek(fatms_ctx *c, OpenFile *f, SceOff ofs, int whence, SceOff *out) 
     ENTER(c);
     int r = fatfs_fd_valid(c, f);
     if (r < 0) return r;
+    if (c->exfat && !es_is_file(f)) return exfat_lseek(c, f, ofs, whence, out);   /* DratiniFS: 64-bit */
     u32 lo = (u32)ofs; int hi = (int)((u64)ofs >> 32);
     u32 span = (u32)(hi + 1) - (lo == 0);
     if (span > 1 || (span == 1 && lo == 0)) return FAT_EINVAL;           /* |ofs| must fit in 32 bits */
@@ -193,6 +194,7 @@ int fatfs_at_eof(fatms_ctx *c, OpenFile *f)                             /* FUN_0
     ENTER(c);
     int r = fatfs_fd_valid(c, f);
     if (r < 0) return r;
+    if (c->exfat && !es_is_file(f)) return exfat_at_eof(c, f);                     /* DratiniFS: 64-bit */
     return F_SIZE(f) <= f->position;
 }
 

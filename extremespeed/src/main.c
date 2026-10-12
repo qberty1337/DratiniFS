@@ -26,17 +26,22 @@ PSP_HEAP_SIZE_KB(-1024);
 static int exit_requested = 0;
 static int prx_found = 0, backup_found = 0, flash_state = 0;
 static int flash_damaged = 0;              /* Sony's driver runs, yet flash0's file differs from the backup */
+static int dc_state = -1, dc_backup_found = 0;   /* DCARK's copy of the driver, see dc_refresh() */
 
 /* The PSP Go loads fatmsef.prx (sceFATFS_Driver: ms0: + internal storage) instead of fatms.prx, so it
    gets the Go build of the driver and keeps its own backup: a backup is never restored onto the
-   other kind of PSP. */
+   other kind of PSP. ARK's DC (DCARK) boots from the memory stick with its own copy of flash0 in
+   ms0:/TM/DCARK/ (a path ARK's DC installer and IPL hard-code), so it loads the driver from there. */
 static const char *drv_src = "dratinifs.prx", *drv_dst = "flash0:/kd/fatms.prx", *drv_backup = "backup.prx";
+static const char *dc_dst = "ms0:/TM/DCARK/kd/fatms.prx", *dc_backup = "backup_dcark.prx";
 static void pick_driver(void)
 {
     if (kuKernelGetModel() == 4) {                  /* PSP Go (05g) */
         drv_src = "dratinifs_go.prx";
         drv_dst = "flash0:/kd/fatmsef.prx";
         drv_backup = "backup_go.prx";
+        dc_dst = "ms0:/TM/DCARK/kd/fatmsef.prx";
+        dc_backup = "backup_dcark_go.prx";
     }
 }
 
@@ -2698,6 +2703,20 @@ static int files_equal(const char *a, const char *b)                 /* 1 = same
     free(x); free(y);
     return same;
 }
+static int file_exists(const char *path)
+{
+    SceIoStat st;
+    return sceIoGetstat(path, &st) >= 0;
+}
+/* one of our builds (pspgz.py: ~PSP header + plain gzip, ARK's tag 0xDADADAF0), not Sony's encrypted file */
+static int is_plain_prx(const char *path)
+{
+    unsigned char h[0x152];
+    SceUID fd = sceIoOpen(path, PSP_O_RDONLY, 0);
+    int n = fd >= 0 ? sceIoRead(fd, h, sizeof(h)) : 0;
+    if (fd >= 0) sceIoClose(fd);
+    return n == (int)sizeof(h) && memcmp(h, "~PSP", 4) == 0 && h[0x150] == 0x1F && h[0x151] == 0x8B;
+}
 
 static int kflash_install(const char *src, const char *dst)
 {
@@ -2735,7 +2754,7 @@ static int kflash_install(const char *src, const char *dst)
 /* what went wrong, for the screen */
 static void kflash_explain(int rc)
 {
-    static const char *steps[] = { "", "bad arguments", "assign flash0", "open the file in flash0 for writing",
+    static const char *steps[] = { "", "bad arguments", "assign flash0", "open the file for writing",
                                    "write the file", "reopen it to check", "read it back", "check: the bytes differ" };
     int step = (rc > 0) ? (rc >> 24) : 0;
     if (rc == (int)0x800200D2)
@@ -2748,11 +2767,49 @@ static void kflash_explain(int rc)
         printf("Error 0x%08X (loading kernel_flash.prx)\n", rc);
 }
 
-static void install_flash0(void)
+/* DCARK's copy is a file on ms0: we write it ourselves (no kernel writer, no flash0 remount) with the
+   same checks and the same answers as kernel_flash.prx, so the install code below serves both. */
+static int ms0_install(const char *src, const char *dst)
 {
+    int size = 0, rc = 0;
+    unsigned char *buf = read_whole(src, &size);
+    if (!buf) return KF_READ_SRC << 24;
+    SceUID fd = sceIoOpen(dst, PSP_O_WRONLY | PSP_O_CREAT | PSP_O_TRUNC, 0777);
+    if (fd < 0) rc = (KF_OPEN << 24) | (fd & 0xFFFFFF);
+    else {
+        int w = sceIoWrite(fd, buf, size);
+        int c = sceIoClose(fd);
+        if (w != size || c < 0) rc = (KF_WRITE << 24) | ((w < 0 ? w : c < 0 ? c : 0) & 0xFFFFFF);
+        else if (!files_equal(src, dst)) rc = KF_MISMATCH << 24;
+    }
+    free(buf);
+    return rc;
+}
+
+/* DCARK's driver: -1 no DCARK on the card, 0 the original (Sony's), 1 another DratiniFS build,
+   2 the one next to EBOOT.PBP, 3 changed: neither ours nor the backup taken from it (a failed write) */
+static void dc_refresh(void)
+{
+    char prx_path[512], backup_path[512];
+    int dlen = eboot_dir_len();
+    dc_state = -1;
+    dc_backup_found = 0;
+    if (dlen < 0 || !file_exists(dc_dst)) return;
+    in_eboot_dir(prx_path, dlen, drv_src);
+    in_eboot_dir(backup_path, dlen, dc_backup);
+    dc_backup_found = file_exists(backup_path);
+    if (is_plain_prx(dc_dst)) dc_state = files_equal(dc_dst, prx_path) ? 2 : 1;
+    else dc_state = (dc_backup_found && !files_equal(dc_dst, backup_path)) ? 3 : 0;
+}
+
+/* dc = 0: flash0, through kernel_flash.prx; dc = 1: DCARK's copy on ms0 */
+static void install_driver(int dc)
+{
+    const char *dst = dc ? dc_dst : drv_dst, *bk_name = dc ? dc_backup : drv_backup;
+    const char *where = dc ? "DCARK" : "flash0";
     pspDebugScreenClear();
     pspDebugScreenSetTextColor(0xFF00FFFF);
-    printf("\n  Install DratiniFS to flash0\n\n");
+    printf("\n  Install DratiniFS to %s\n\n", where);
 
     int dlen = eboot_dir_len();
     if (dlen < 0) {
@@ -2765,7 +2822,7 @@ static void install_flash0(void)
 
     char prx_path[512], backup_path[512];
     in_eboot_dir(prx_path, dlen, drv_src);
-    in_eboot_dir(backup_path, dlen, drv_backup);
+    in_eboot_dir(backup_path, dlen, bk_name);
 
     // verify source exists and get size for display
     SceUID src = sceIoOpen(prx_path, PSP_O_RDONLY, 0);
@@ -2783,11 +2840,14 @@ static void install_flash0(void)
     pspDebugScreenSetTextColor(0xFFFFFFFF);
     printf("Source:  %s\n", prx_path);
     printf("Size:    %d bytes\n", (int)file_size);
-    printf("Dest:    %s\n\n", drv_dst);
+    printf("Dest:    %s\n\n", dst);
 
+    // Sony's original is always (re)backed up, but an update never replaces an existing backup
+    // with one of our builds: the backup stays the original
+    int take_backup = !is_plain_prx(dst) || !file_exists(backup_path);
     pspDebugScreenSetTextColor(0xFF00FFFF);
-    printf("This will OVERWRITE %s!\n", drv_dst);
-    printf("The original will be backed up to %s.\n\n", drv_backup);
+    printf("This will OVERWRITE %s!\n", dst);
+    printf(take_backup ? "The original will be backed up to %s.\n\n" : "The original stays in %s.\n\n", bk_name);
     pspDebugScreenSetTextColor(0xFFFFFFFF);
     printf("Press X to install, O to cancel.\n");
 
@@ -2807,48 +2867,56 @@ static void install_flash0(void)
     }
 
     // backup the current driver before overwriting
-    printf("\nBacking up %s...\n", drv_dst);
-    int backup_bytes = copy_file(drv_dst, backup_path);
-    if (backup_bytes <= 0 || !files_equal(drv_dst, backup_path)) {
-        pspDebugScreenSetTextColor(0xFF0000FF);
-        printf("Error: could not backup %s\n(the copy is missing or differs).\n", drv_dst);
-        printf("\nPress X to return.\n");
-        wait_cross();
-        return;
+    if (take_backup) {
+        printf("\nBacking up %s...\n", dst);
+        int backup_bytes = copy_file(dst, backup_path);
+        if (backup_bytes <= 0 || !files_equal(dst, backup_path)) {
+            pspDebugScreenSetTextColor(0xFF0000FF);
+            printf("Error: could not backup %s\n(the copy is missing or differs).\n", dst);
+            printf("\nPress X to return.\n");
+            wait_cross();
+            return;
+        }
+        printf("Backup saved and checked (%d bytes).\n", backup_bytes);
     }
-    printf("Backup saved and checked (%d bytes).\n", backup_bytes);
 
-    printf("Invoking kernel writer for flash0...\n");
+    printf(dc ? "Writing it...\n" : "Invoking kernel writer for flash0...\n");
 
-    int rc = kflash_install(prx_path, drv_dst);
+    int rc = dc ? ms0_install(prx_path, dst) : kflash_install(prx_path, dst);
 
     if (rc == 0) {
-        flash_state = 2;
-        backup_found = 1;
+        if (!dc) { flash_state = 2; backup_found = 1; }
         pspDebugScreenSetTextColor(0xFF00FF00);
-        printf("\nDratiniFS installed to %s (%d bytes).\n", drv_dst, (int)file_size);
+        printf("\nDratiniFS installed to %s (%d bytes).\n", dst, (int)file_size);
+        if (dc) {                                          /* DCARK loads it at its next boot */
+            printf("\nPress X to return.\n");
+            wait_cross();
+            return;
+        }
         printf("\nPress X to reboot.\n");
         wait_cross();
         scePowerRequestColdReset(0);
     } else {
         pspDebugScreenSetTextColor(0xFF0000FF);
-        printf("Error: flash0 write failed.\n");
+        printf("Error: %s write failed.\n", where);
         kflash_explain(rc);
         int step = rc > 0 ? rc >> 24 : 0;
         if (step >= KF_WRITE && step <= KF_MISMATCH) {     /* the file may be damaged: put the original back */
             pspDebugScreenSetTextColor(0xFF00FFFF);
-            printf("\nRestoring the original %s from %s...\n", drv_dst, drv_backup);
-            int rr = kflash_install(backup_path, drv_dst);
-            if (rr == 0 && files_equal(backup_path, drv_dst)) {
+            printf("\nRestoring the original %s from %s...\n", dst, bk_name);
+            int rr = dc ? ms0_install(backup_path, dst) : kflash_install(backup_path, dst);
+            if (rr == 0 && files_equal(backup_path, dst)) {
                 pspDebugScreenSetTextColor(0xFF00FF00);
-                printf("Original restored and checked. flash0 is as before.\n");
+                if (take_backup) printf("Original restored and checked. %s is as before.\n", where);
+                else printf("Original restored and checked: DratiniFS is\nno longer in %s.\n", where);
             } else {
                 pspDebugScreenSetTextColor(0xFF0000FF);
-                printf("RESTORE FAILED. Do NOT turn the PSP off or reboot.\n");
+                printf(dc ? "RESTORE FAILED. Don't boot DCARK until it's restored.\n"
+                          : "RESTORE FAILED. Do NOT turn the PSP off or reboot.\n");
                 kflash_explain(rr);
             }
         } else {
-            printf("Nothing in flash0 was changed.\n");
+            printf("Nothing in %s was changed.\n", where);
         }
         pspDebugScreenSetTextColor(0xFFFFFFFF);
         printf("\nPress X to return.\n");
@@ -2856,11 +2924,13 @@ static void install_flash0(void)
     }
 }
 
-static void uninstall_flash0(void)
+static void uninstall_driver(int dc)
 {
+    const char *dst = dc ? dc_dst : drv_dst, *bk_name = dc ? dc_backup : drv_backup;
+    const char *where = dc ? "DCARK" : "flash0", *name = strrchr(dst, '/') + 1;
     pspDebugScreenClear();
     pspDebugScreenSetTextColor(0xFF00FFFF);
-    printf("\n  Uninstall DratiniFS from flash0\n\n");
+    printf("\n  Uninstall DratiniFS from %s\n\n", where);
 
     int dlen = eboot_dir_len();
     if (dlen < 0) {
@@ -2872,13 +2942,13 @@ static void uninstall_flash0(void)
     }
 
     char backup_path[512];
-    in_eboot_dir(backup_path, dlen, drv_backup);
+    in_eboot_dir(backup_path, dlen, bk_name);
 
     // verify backup exists and get size
     SceUID bk = sceIoOpen(backup_path, PSP_O_RDONLY, 0);
     if (bk < 0) {
         pspDebugScreenSetTextColor(0xFF0000FF);
-        printf("Error: %s not found.\n", drv_backup);
+        printf("Error: %s not found.\n", bk_name);
         printf("\nPress X to return.\n");
         wait_cross();
         return;
@@ -2889,10 +2959,10 @@ static void uninstall_flash0(void)
     pspDebugScreenSetTextColor(0xFFFFFFFF);
     printf("Source:  %s\n", backup_path);
     printf("Size:    %d bytes\n", (int)file_size);
-    printf("Dest:    %s\n\n", drv_dst);
+    printf("Dest:    %s\n\n", dst);
 
     pspDebugScreenSetTextColor(0xFF00FFFF);
-    printf("This will restore the original %s.\n\n", drv_dst + 13);
+    printf("This will restore the original %s.\n\n", name);
     pspDebugScreenSetTextColor(0xFFFFFFFF);
     printf("Press X to uninstall, O to cancel.\n");
 
@@ -2910,26 +2980,32 @@ static void uninstall_flash0(void)
         sceDisplayWaitVblankStart();
     }
 
-    printf("\nInvoking kernel writer for flash0...\n");
+    printf(dc ? "\nWriting it...\n" : "\nInvoking kernel writer for flash0...\n");
 
-    int rc = kflash_install(backup_path, drv_dst);
+    int rc = dc ? ms0_install(backup_path, dst) : kflash_install(backup_path, dst);
 
     if (rc == 0) {
-        flash_state = 0;
+        if (!dc) flash_state = 0;
         pspDebugScreenSetTextColor(0xFF00FF00);
-        printf("\nOriginal %s restored (%d bytes).\n", drv_dst + 13, (int)file_size);
+        printf("\nOriginal %s restored (%d bytes).\n", name, (int)file_size);
+        if (dc) {
+            printf("\nPress X to return.\n");
+            wait_cross();
+            return;
+        }
         printf("\nPress X to reboot.\n");
         wait_cross();
         scePowerRequestColdReset(0);
     } else {
         pspDebugScreenSetTextColor(0xFF0000FF);
-        printf("Error: flash0 write failed.\n");
+        printf("Error: %s write failed.\n", where);
         kflash_explain(rc);
         int step = rc > 0 ? rc >> 24 : 0;
         if (step >= KF_WRITE && step <= KF_MISMATCH)
-            printf("\nThe file in flash0 may be damaged. Do NOT reboot:\nrun Uninstall again.\n");
+            printf(dc ? "\nDCARK's copy may be damaged: restore it again\nfrom the menu before booting DCARK.\n"
+                      : "\nThe file in flash0 may be damaged. Do NOT reboot:\nrun Uninstall again.\n");
         else
-            printf("Nothing in flash0 was changed.\n");
+            printf("Nothing in %s was changed.\n", where);
         printf("\nPress X to return.\n");
         wait_cross();
     }
@@ -2990,6 +3066,7 @@ int main(int argc, char *argv[])
     const char *menu_items[MAX_MENU];
     int num_items = 0;
     int idx_install = -1, idx_uninstall = -1, idx_partinfo = -1, idx_partition = -1;
+    int idx_dc_install = -1, idx_dc_uninstall = -1;
     int idx_list = -1, idx_to_es = -1, idx_from_es = -1;
     int idx_all_to = -1, idx_all_from = -1, idx_delete = -1;
     int idx_compact = -1, idx_format = -1, idx_exit = -1;
@@ -3004,6 +3081,7 @@ int main(int argc, char *argv[])
             flash_damaged = !files_equal(drv_dst, path);
         }
     }
+    dc_refresh();
 
     // cache es state - only refresh after returning from submenus
     int es_detected = 0;
@@ -3014,6 +3092,7 @@ int main(int argc, char *argv[])
     #define REBUILD_MENU() do { \
         num_items = 0; \
         idx_install = idx_uninstall = idx_partinfo = idx_partition = -1; \
+        idx_dc_install = idx_dc_uninstall = -1; \
         idx_list = idx_to_es = idx_from_es = -1; \
         idx_all_to = idx_all_from = idx_delete = -1; \
         idx_compact = idx_format = idx_exit = -1; \
@@ -3021,6 +3100,10 @@ int main(int argc, char *argv[])
         else if (prx_found && flash_state == 0) { idx_install = num_items; menu_items[num_items++] = "Install DratiniFS to flash0"; } \
         else if (prx_found && flash_state == 1) { idx_install = num_items; menu_items[num_items++] = "Update DratiniFS in flash0"; } \
         else if (flash_state == 2 && backup_found) { idx_uninstall = num_items; menu_items[num_items++] = "Uninstall DratiniFS"; } \
+        if (dc_state == 3) { idx_dc_uninstall = num_items; menu_items[num_items++] = "RESTORE DCARK's ORIGINAL DRIVER (it changed!)"; } \
+        else if (prx_found && dc_state == 0) { idx_dc_install = num_items; menu_items[num_items++] = "Install DratiniFS to DCARK"; } \
+        else if (prx_found && dc_state == 1) { idx_dc_install = num_items; menu_items[num_items++] = "Update DratiniFS in DCARK"; } \
+        else if (dc_state == 2 && dc_backup_found) { idx_dc_uninstall = num_items; menu_items[num_items++] = "Uninstall DratiniFS from DCARK"; } \
         idx_partinfo = num_items; menu_items[num_items++] = "Show Partition Info"; \
         idx_partition = num_items; menu_items[num_items++] = es_detected ? "Delete ExtremeSpeed Partition" : "Create ExtremeSpeed Partition"; \
         idx_list = num_items; menu_items[num_items++] = "List ExtremeSpeed ISOs"; \
@@ -3068,8 +3151,10 @@ int main(int argc, char *argv[])
         if (pad.Buttons & PSP_CTRL_DOWN) { if (sel < num_items - 1) sel++; wait_release(PSP_CTRL_DOWN); }
         if (pad.Buttons & PSP_CTRL_CROSS) {
             wait_release(PSP_CTRL_CROSS);
-            if (sel == idx_install)        install_flash0();
-            else if (sel == idx_uninstall) uninstall_flash0();
+            if (sel == idx_install)        install_driver(0);
+            else if (sel == idx_uninstall) uninstall_driver(0);
+            else if (sel == idx_dc_install)   install_driver(1);
+            else if (sel == idx_dc_uninstall) uninstall_driver(1);
             else if (sel == idx_partinfo) show_partition_info();
             else if (sel == idx_partition) {
                 ExtremeSpeedInfo _ei;
@@ -3112,6 +3197,7 @@ int main(int argc, char *argv[])
                     if (fd >= 0) { backup_found = 1; sceIoClose(fd); }
                 }
             }
+            dc_refresh();
             REBUILD_MENU();
             if (sel >= num_items) sel = num_items - 1;
         }

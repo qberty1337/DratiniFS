@@ -276,8 +276,12 @@ static void g_seek(void)
     EQ((int)r, E_EINVAL); CHECK(r < 0);
     r = fs_lseek(fd, -(s64)size - 1, PSP_SEEK_END);
     EQ((int)r, E_EINVAL); CHECK(r < 0);
-    r = fs_lseek(fd, 0x100000000LL, PSP_SEEK_SET);   /* beyond 4 GB */
-    EQ((int)r, E_EINVAL); CHECK(r < 0);
+    r = fs_lseek(fd, 0x100000000LL, PSP_SEEK_SET);   /* beyond 4 GB: FAT's limit, not exFAT's */
+    if (FLAGS & FST_LARGE) {
+        EQ(r, 0x100000000LL);
+        EQ(fs_read(fd, b, 8), 0);                    /* past the end: nothing */
+        EQ(fs_lseek(fd, 10, PSP_SEEK_SET), 10);
+    } else { EQ((int)r, E_EINVAL); CHECK(r < 0); }
     r = fs_lseek(fd, 0, 3);                                                         /* iofilemgr checks whence */
     EQ((int)r, E_IO_INVAL); CHECK(r < 0);
     EQ(fs_lseek(fd, 0, PSP_SEEK_CUR), 10);           /* failed seeks leave the position */
@@ -364,12 +368,17 @@ static void g_gap(void)
     fs_close(fd);
     SceIoStat st;
     EQ(fs_getstat(f, &st), 0);
-    EQ(st.st_size, at + 10);                            /* the gap is allocated, not zeroed */
+    EQ(st.st_size, at + 10);                            /* FAT: the gap is allocated, not zeroed */
     fd = fs_open(f, PSP_O_RDONLY, 0);
     EQ(fs_lseek(fd, at, PSP_SEEK_SET), at);
     EQ(fs_read(fd, VB, 64), 10);
     CHECK(!memcmp(VB, WB, 10));
     EQ(read_cmp(fd, 40, 0, 100, 0), 0);
+    if (FLAGS & FST_LARGE) {                            /* exFAT: the gap was past ValidDataLength, so zeros */
+        int zero = fs_lseek(fd, 100, PSP_SEEK_SET) == 100 && fs_read(fd, VB, (int)(at - 100)) == (int)(at - 100);
+        for (u32 i = 0; zero && i < at - 100; i++) zero = VB[i] == 0;
+        CHECK(zero);
+    }
     fs_close(fd);
 }
 

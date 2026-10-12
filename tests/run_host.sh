@@ -389,6 +389,34 @@ else
     grep -E 'FAIL|RESULT|devinfo' "$O/shortfat.log"; fail "short FAT (hang or wrong cluster count)"
 fi
 
+# ---- exFAT files past 4 GB: a 16 GB sparse volume (32 KB clusters) whose big contiguous files are laid out by
+# exfat_bigfile.py (no gigabytes written). The driver reads and writes across 4 GB, renames, moves, appends
+# (chaining the file), fills a gap, removes and truncates. fsck.exfat must pass before and after, and
+# fuse-exfat must read back the size and the bytes the driver wrote.
+echo "== exfat big files (past 4 GB)"
+BIGI=/tmp/exbig.img
+rm -f $BIGI; truncate -s 16G $BIGI
+mkfs.exfat -q -c 32768 $BIGI >/dev/null &&
+    python3 host/exfat_bigfile.py make $BIGI BIG.BIN 5368721465 BIG3.BIN 4294968073 BIG4.BIN 4294967301 > "$O/exbig.make.log" ||
+    fail "exbig: building the volume"
+fsck.exfat -n $BIGI > "$O/fsck.txt" 2>&1 || { sed 's/^/   /' "$O/fsck.txt"; fail "exbig: the script's volume isn't clean"; }
+if "$O/fstest_host" exbig $BIGI - > "$O/exbig.log" 2>&1; then
+    grep '^RESULT' "$O/exbig.log" | sed 's/^/   /'
+else
+    grep -E 'FAIL|RESULT' "$O/exbig.log"; fail "exfat big files"
+fi
+fsck.exfat -n $BIGI > "$O/fsck.txt" 2>&1 || { sed 's/^/   /' "$O/fsck.txt"; fail "fsck.exfat after the big-file run"; }
+if xmount $BIGI; then
+    python3 host/exfat_bigfile.py check "$O/mnt/VID/Big Video.mp4" 5368871475 \
+        4294967288 43524f53532d3447422d4f4b21212121 5368721457 3130004001000001 4295000067 0380000001000001 \
+        0 0000000000000001 5368721465 030a11181f262d343b424950575e656c 5368821449 f3fa01080f161d242b323940474e555c \
+        5368822465 00000000000000000000000000000000 5368871465 454e442d4d41524b4552 | sed 's/^/   fuse-exfat: /' ||
+        fail "fuse-exfat reads the big file differently"
+    [ -e "$O/mnt/BIG3.BIN" ] && fail "BIG3.BIN still there"
+    xumount
+else fail "fuse mount (exbig)"; fi
+rm -f $BIGI
+
 # ---- PSP Go (fatmsef.prx): the same sources with PSPGO, serving ms0: + ef0: + eh0: ----
 # ef0:/eh0: are eflash image files (host_ef_load). The Memory Stick is the ES card from above.
 echo "== build (PSP Go)"

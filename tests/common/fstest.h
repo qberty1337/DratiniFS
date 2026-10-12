@@ -45,6 +45,7 @@ void fs_after_group(const char *name);       /* hook after each group (host: opt
 #define FST_BIG           0x02   /* include the >1024-cluster file (cluster checkpoints, ~35 MB on a PSP) */
 #define FST_KEEP          0x04   /* leave the test tree on the card */
 #define FST_NAMES_ONLY    0x08   /* only the name / listing groups (second SDK-mode pass) */
+#define FST_LARGE         0x10   /* files may pass 4 GB (exFAT under DratiniFS): a seek there succeeds */
 
 typedef struct { int pass, fail, skip; } fst_result;
 

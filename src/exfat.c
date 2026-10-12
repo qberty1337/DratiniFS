@@ -6,13 +6,17 @@
  * Each worker below mirrors the Sony FAT worker it replaces (same checks, same order).
  *
  * Open files keep Sony's 32-byte FAT-style entry (f->entry) as their in-memory record: attribute,
- * DOS timestamps (exFAT timestamps use the same bit layout), first cluster, size, and the stream's
- * flags in byte 0x0c. It goes back into the on-disk entry set (fresh checksum) whenever it changes.
+ * DOS timestamps (exFAT timestamps use the same bit layout), first cluster, and the stream's flags in
+ * byte 0x0c. It goes back into the on-disk entry set (fresh checksum) whenever it changes.
+ * Sizes and positions are 64-bit (files past 4 GB): each open file's DataLength, ValidDataLength and
+ * position live in X.fd64; Sony's 32-bit size and position fields keep a copy capped at 4 GB - 1
+ * (xsync). Seek and the EOF test hand over too (fatfs_lseek, fatfs_at_eof). Bytes past
+ * ValidDataLength read as zeros; a write past it zero-fills the gap first.
  * Short (8.3) names are Sony's FAT aliases computed from the long name (alias_init, ~N counted in
  * directory order); they fill d_private and can be opened, as on FAT.
  * No caches beyond Sony's FAT window: directory and bitmap sectors are written before an operation
  * returns. All work runs under the volume mutex, so the work buffers are static (X).
- * Limits: 512-byte sectors, files < 4 GB (Sony's API), clusters up to 16 MB, one active FAT and
+ * Limits: 512-byte sectors, clusters up to 16 MB, fewer than 2^32 clusters per file, one active FAT and
  * bitmap (TexFAT volumes mount write-protected). New files and directories use FAT chains;
  * contiguous (NoFatChain) ones written elsewhere are read as they are and chained when they grow. */
 #include "fatms.h"
@@ -26,7 +30,8 @@
 typedef struct { u32 lba[3]; u32 off, n; } xloc;                    /* an entry set: <= 19 entries, 3 sectors */
 typedef struct { u32 first, nofat, nclus, cl, cidx, off; } xpos;    /* a position in a directory */
 typedef struct { u32 first, nofat, size, root; xloc loc; u8 ent[32]; } xdir;
-typedef struct { u8 base[11]; u8 pad; u32 count; } xnum;            /* ~N numbering, by directory order */
+typedef struct { u8 base[11]; u8 pad; u32 count; } xnum;
+typedef struct { u64 size, valid, pos; } xfile;                     /* an open file: DataLength, ValidDataLength, position */            /* ~N numbering, by directory order */
 typedef struct { u32 magic; xpos pos; u32 dots, end, ntab; u8 ent[32]; xnum tab[16]; } xdh;   /* dread state */
 #define XDH(d) ((xdh *)((u8 *)(d) + 0x440))                         /* behind Sony's DirHandle, same block */
 _Static_assert(sizeof(DirHandle) <= 0x440 && 0x440 + sizeof(xdh) <= 0x5a0, "dir handle room (es.c from 0x5a0)");
@@ -47,12 +52,17 @@ static struct {
     fpath fp;
     xnum tab[32]; u32 ntab;                      /* alias numbering for lookups */
     xloc fdloc[FAT_NUM_FD];                      /* where each open file's set lives */
+    xfile fd64[FAT_NUM_FD];                      /* each open file's 64-bit sizes and position */
+    u8  zero[4096] __attribute__((aligned(64))); /* zero-fill source (writes past ValidDataLength) */
 } X;
 
 static u32 le16(const u8 *p) { return (u32)(p[0] | p[1] << 8); }
 static u32 le32(const u8 *p) { return le16(p) | le16(p + 2) << 16; }
 static void put16(u8 *p, u32 v) { p[0] = (u8)v; p[1] = (u8)(v >> 8); }
 static void put32(u8 *p, u32 v) { put16(p, v); put16(p + 2, v >> 16); }
+static u64 le64(const u8 *p) { return le32(p) | (u64)le32(p + 4) << 32; }
+static void put64(u8 *p, u64 v) { put32(p, (u32)v); put32(p + 4, (u32)(v >> 32)); }
+static u32 cap32(u64 v) { return v > 0xffffffffu ? 0xffffffffu : (u32)v; }   /* Sony's 32-bit view */
 static u32 xcb(fatms_ctx *c) { return (u32)c->bytes_per_sector * c->sectors_per_cluster; }
 static u32 wlen(const u16 *s) { u32 n = 0; while (s[n]) n++; return n; }
 static int same11(const u8 *a, const u8 *b) { for (int i = 0; i < 11; i++) if (a[i] != b[i]) return 0; return 1; }
@@ -212,9 +222,10 @@ static void xto_ent(const u8 *s, u8 *ent)
     put32(ent + 0x16, le32(s + 12));                            /* modify time + date */
     u32 cl = le32(s + 52);
     put16(ent + 0x1a, cl); put16(ent + 0x14, cl >> 16);
-    put32(ent + 0x1c, (ent[0x0b] & 0x10) ? 0 : le32(s + 60) ? 0xffffffffu : le32(s + 56));
+    put32(ent + 0x1c, (ent[0x0b] & 0x10) ? 0 : cap32(le64(s + 56)));
 }
-/* ... and back (names and directory sizes stay as they are; a changed timestamp drops 10ms + UTC) */
+/* ... and back (names and sizes stay as they are: the 32-bit size is only a view, callers write the
+   64-bit DataLength / ValidDataLength; a changed timestamp drops 10ms + UTC) */
 static void xfrom_ent(u8 *s, const u8 *ent)
 {
     put16(s + 4, (le16(s + 4) & ~0x37u) | (ent[0x0b] & 0x37));
@@ -223,13 +234,9 @@ static void xfrom_ent(u8 *s, const u8 *ent)
     if (le32(s + 16) >> 16 != le16(ent + 0x12)) { put32(s + 16, le16(ent + 0x12) << 16); s[24] = 0; }
     s[33] = (u8)(1 | (ent[0x0c] & X_NOFAT));                    /* AllocationPossible */
     put32(s + 52, le16(ent + 0x1a) | le16(ent + 0x14) << 16);
-    if (!(ent[0x0b] & 0x10)) {
-        u32 size = le32(ent + 0x1c);
-        put32(s + 40, size); put32(s + 44, 0); put32(s + 56, size); put32(s + 60, 0);
-    }
 }
-/* a new set in X.set: file + stream + names (dirsize: a directory's DataLength) */
-static void xbuild(const u16 *name, const u8 *ent, u32 dirsize)
+/* a new set in X.set: file + stream + names, with its ValidDataLength and DataLength */
+static void xbuild(const u16 *name, const u8 *ent, u64 valid, u64 size)
 {
     u32 nlen = wlen(name), nn = (nlen + 14) / 15, n = 2 + nn;
     memset(X.set, 0, n * 32);
@@ -242,7 +249,7 @@ static void xbuild(const u16 *name, const u8 *ent, u32 dirsize)
         for (u32 j = 0; j < 15 && i * 15 + j < nlen; j++) put16(e + 2 + j * 2, name[i * 15 + j]);
     }
     xfrom_ent(X.set, ent);
-    if (ent[0x0b] & 0x10) { put32(X.set + 40, dirsize); put32(X.set + 56, dirsize); }
+    put64(X.set + 40, valid); put64(X.set + 56, size);
     X.set_n = n;
 }
 
@@ -344,12 +351,12 @@ static int xextend(fatms_ctx *c, u32 last, u32 count, u32 *got)  /* link `count`
     }
     return 0;
 }
-static int xfree(fatms_ctx *c, u32 cl, int nofat, u32 bytes)   /* release a chain or a contiguous run */
+static int xfree(fatms_ctx *c, u32 cl, int nofat, u64 bytes)   /* release a chain or a contiguous run */
 {
     if (cl < 2) return 0;
     u32 cb = xcb(c);
     if (nofat) {
-        u32 n = (bytes + cb - 1) / cb;
+        u32 n = (u32)((bytes + cb - 1) / cb);
         for (u32 i = 0; i < (n ? n : 1); i++) { int r = xbm_clear(c, cl + i); if (r < 0) return r; }
         return 0;
     }
@@ -370,12 +377,12 @@ static int xflush(fatms_ctx *c)                                 /* bitmap, then 
     return r > 0 ? 0 : r;
 }
 /* contiguous file data (NoFatChain): partial clusters via Sony's sector_io, whole ones in one go */
-static int xcontig(fatms_ctx *c, int write, u8 *buf, u32 first, u32 pos, u32 len, u32 *done)
+static int xcontig(fatms_ctx *c, int write, u8 *buf, u32 first, u64 pos, u32 len, u32 *done)
 {
     u32 cb = xcb(c), total = 0;
     *done = 0;
     while (total < len) {
-        u32 cl = first + pos / cb, off = pos % cb, got;
+        u32 cl = first + (u32)(pos / cb), off = (u32)(pos % cb), got;
         int r;
         if (off == 0 && len - total >= cb) {
             u32 nc = (len - total) / cb, lba = fatfs_clus2lba(c, cl), ns = nc * c->sectors_per_cluster;
@@ -387,6 +394,39 @@ static int xcontig(fatms_ctx *c, int write, u8 *buf, u32 first, u32 pos, u32 len
         *done = total;
     }
     return 0;
+}
+/* chained file data: Sony's transfer loop (fatfs_data_io) from a 64-bit position, the cluster index
+   kept on its own (pos / cluster size no longer fits Sony's 32-bit pos). cl = the cluster at pos. */
+static int xchained(fatms_ctx *c, OpenFile *f, int write, u8 *buf, u64 pos, u32 len, u32 cl, u32 *done)
+{
+    u32 cb = xcb(c), off = (u32)(pos % cb), cidx = (u32)(pos / cb), total = 0;
+    *done = 0;
+    for (;;) {
+        u32 got;
+        int r;
+        if (off == 0 && len >= cb) {                            /* a contiguous run of whole clusters */
+            u32 n = 1, last = cl;
+            while ((n + 1) * cb <= len) {
+                u32 nx;
+                if (fat_get(&c->fe, last, &nx) < 0 || nx != last + 1) break;
+                last = nx; n++;
+                fatfs_ckpt_record(f, cidx + n - 1, last);
+            }
+            u32 lba = fatfs_clus2lba(c, cl), ns = n * c->sectors_per_cluster;
+            r = write ? c->blk->write_sectors(c, buf, lba, ns) : c->blk->read_sectors(c, buf, lba, ns);
+            if (r < 0) return r;
+            got = n * cb; cl = last; cidx += n - 1;
+        } else if ((r = fatfs_sector_io(c, write, off, len, buf, fatfs_clus2lba(c, cl), &got)) < 0) return r;
+        buf += got; total += got; len -= got;
+        f->cur_cluster = cl; f->cur_cluster_index = cidx;
+        *done = total;
+        if (len == 0) return 0;
+        u32 nx;
+        if ((r = fatfs_walk(c, cl, 1, &nx)) < 0) return r;
+        if (nx >= c->fat_max_cluster) return FAT_ENOSPC;
+        cl = nx; cidx++; off = 0;
+        fatfs_ckpt_record(f, cidx, cl);
+    }
 }
 
 /* ---------------- directories ---------------- */
@@ -527,6 +567,12 @@ static int xslot(fatms_ctx *c, OpenFile *f)
     for (int i = 0; i < FAT_NUM_FD; i++) if (c->fd[i] == (void *)f) return i;
     return -1;
 }
+static xfile *xfile_of(fatms_ctx *c, OpenFile *f) { int i = xslot(c, f); return &X.fd64[i < 0 ? 0 : i]; }
+static void xsync(OpenFile *f, u64 size, u64 pos)               /* Sony's 32-bit copies */
+{
+    F_SIZE(f) = cap32(size);
+    f->position = cap32(pos);
+}
 /* an open file's entry -> its set on the card (unless the set is gone: renamed or removed) */
 static int xput(fatms_ctx *c, OpenFile *f)
 {
@@ -537,6 +583,7 @@ static int xput(fatms_ctx *c, OpenFile *f)
     if (r < 0) return r;
     if (X.tmp[0] != 0x85 || X.tmp[32] != 0xc0 || 1u + X.tmp[1] != loc->n) return 0;
     xfrom_ent(X.tmp, f->entry);
+    put64(X.tmp + 40, X.fd64[i].valid); put64(X.tmp + 56, X.fd64[i].size);
     return xset_io(c, loc, X.tmp, 1);
 }
 
@@ -646,34 +693,40 @@ int exfat_open(fatms_ctx *c, fpath *p, unsigned flags, OpenFile **out)
         memset(ent, 0, 32);
         dirent_stamp(ent, 1);
         ent[0x0b] = 0x20;
-        xbuild(p->leaf, ent, 0);
+        xbuild(p->leaf, ent, 0, 0);
         if ((r = xplace(c, &d, X.set_n, &loc)) < 0 || (r = xset_io(c, &loc, X.set, 1)) < 0) { xflush(c); return r; }
     } else {
         if (!exists) return FAT_ENOENT;                         /* Sony: the second lookup fails */
         if (X.set[4] & 0x10) return FAT_EACCES;                 /* a directory */
-        if ((flags & 2) && ((X.set[4] & 0x19) || (c->media_flags & MF_WP) || le32(X.set + 60))) return FAT_EACCES;
+        if ((flags & 2) && ((X.set[4] & 0x19) || (c->media_flags & MF_WP))) return FAT_EACCES;
         trunc = (flags & 0x400) != 0;
     }
     memcpy(&f->path, p, sizeof(fpath));
     xto_ent(X.set, f->entry);
     f->first_cluster = le32(X.set + 52);
     X.fdloc[idx] = loc;
+    u64 size = le64(X.set + 56), valid = le64(X.set + 40);
+    if (valid > size) valid = size;
     if (trunc && f->first_cluster) {
-        u32 cl = f->first_cluster, bytes = le32(X.set + 56);
+        u32 cl = f->first_cluster;
         int nofat = f->entry[0x0c] & X_NOFAT;
-        f->first_cluster = 0; F_SIZE(f) = 0;
+        f->first_cluster = 0; size = valid = 0;
         f->entry[0x0c] &= (u8)~X_NOFAT;
         put16(f->entry + 0x1a, 0); put16(f->entry + 0x14, 0);
         xfrom_ent(X.set, f->entry);
+        u64 bytes = le64(X.set + 56);
+        put64(X.set + 40, 0); put64(X.set + 56, 0);
         if ((r = xset_io(c, &loc, X.set, 1)) < 0) return r;
         if ((r = xfree(c, cl, nofat, bytes)) < 0) return r;
     }
     if ((r = xflush(c)) < 0) return r;
-    f->position = 0; f->cur_cluster = f->first_cluster; f->cur_cluster_index = 0; f->ckpt_count = 0;
+    f->cur_cluster = f->first_cluster; f->cur_cluster_index = 0; f->ckpt_count = 0;
     f->rsv[0] = f->rsv[1] = f->rsv[2] = 0;
     memset(f->ckpt, 0, sizeof(f->ckpt));
     f->inuse++;
-    if (flags & 0x100) f->position = F_SIZE(f);
+    X.fd64[idx].size = size; X.fd64[idx].valid = valid;
+    X.fd64[idx].pos = (flags & 0x100) ? size : 0;
+    xsync(f, size, X.fd64[idx].pos);
     f->oflags = flags;
     f->is_dir = 0;
     *out = f;
@@ -691,29 +744,70 @@ int exfat_close(fatms_ctx *c, OpenFile *f)
 int exfat_read(fatms_ctx *c, OpenFile *f, void *buf, int len)
 {
     if (!(f->oflags & 1)) return FAT_EACCES;                    /* not opened for reading */
-    u32 pos = f->position, size = F_SIZE(f), n = (u32)len;
-    if (pos >= size) return 0;
-    if (size - pos < n) n = size - pos;
+    xfile *xf = xfile_of(c, f);
+    u64 pos = xf->pos;
+    u32 n = (u32)len;
+    if (pos >= xf->size) return 0;
+    if (xf->size - pos < n) n = (u32)(xf->size - pos);
     if (n == 0) return 0;
+    u32 data = pos >= xf->valid ? 0 : xf->valid - pos < n ? (u32)(xf->valid - pos) : n;   /* the rest reads as 0 */
     u32 cb = xcb(c), cl, done = 0;
-    int r;
-    if (f->entry[0x0c] & X_NOFAT) r = xcontig(c, 0, (u8 *)buf, f->first_cluster, pos, n, &done);
-    else if ((r = fatfs_seek_cluster(c, f, pos / cb, &cl)) >= 0) r = fatfs_data_io(c, f, 0, (u8 *)buf, pos, n, cl, &done);
+    int r = 0;
+    if (data && (f->entry[0x0c] & X_NOFAT)) r = xcontig(c, 0, (u8 *)buf, f->first_cluster, pos, data, &done);
+    else if (data && (r = fatfs_seek_cluster(c, f, (u32)(pos / cb), &cl)) >= 0) r = xchained(c, f, 0, (u8 *)buf, pos, data, cl, &done);
     if (r < 0) return r;
-    f->position = pos + done;
+    if (done == data && data < n) { memset((u8 *)buf + data, 0, n - data); done = n; }
+    xf->pos = pos + done;
+    xsync(f, xf->size, xf->pos);
     return (int)done;
+}
+
+/* fatfs_lseek's tail with 64-bit positions (Sony: |ofs| < 4 GB, no position past 4 GB - 1) */
+int exfat_lseek(fatms_ctx *c, OpenFile *f, SceOff ofs, int whence, SceOff *out)
+{
+    xfile *xf = xfile_of(c, f);
+    SceOff base;
+    if (whence == 0) base = 0;
+    else if (whence == 1) base = (SceOff)xf->pos;
+    else if (whence == 2) base = (SceOff)xf->size;
+    else return FAT_EINVAL;
+    if (ofs < 0 ? base < -ofs : ofs > 0x7fffffffffffffffLL - base) return FAT_EINVAL;   /* before 0, or past 2^63 */
+    xf->pos = (u64)(base + ofs);
+    xsync(f, xf->size, xf->pos);
+    *out = (SceOff)xf->pos;
+    return 0;
+}
+int exfat_at_eof(fatms_ctx *c, OpenFile *f)                     /* fatfs_at_eof's test */
+{
+    xfile *xf = xfile_of(c, f);
+    return xf->size <= xf->pos;
+}
+
+/* a write starts past ValidDataLength: those bytes become valid, so they are zeroed on the card first */
+static int xzero(fatms_ctx *c, OpenFile *f, int nofat, u64 from, u64 to)
+{
+    u32 cb = xcb(c), cl = 0;
+    while (from < to) {
+        u32 n = (u32)(to - from < sizeof(X.zero) ? to - from : sizeof(X.zero)), off = (u32)(from % cb), done = 0;
+        if (n > cb - off) n = cb - off;                         /* never a whole-cluster run past X.zero */
+        int r;
+        if (nofat) r = xcontig(c, 1, X.zero, f->first_cluster, from, n, &done);
+        else if ((r = fatfs_seek_cluster(c, f, (u32)(from / cb), &cl)) >= 0) r = xchained(c, f, 1, X.zero, from, n, cl, &done);
+        if (r < 0) return r;
+        from += done;
+    }
+    return 0;
 }
 
 int exfat_write(fatms_ctx *c, OpenFile *f, const void *buf, int len)
 {
     X.sec_lba = X_INVAL;
-    u32 n = (u32)len, cb = xcb(c), size = F_SIZE(f);
-    if (f->oflags & 0x100) f->position = size;                  /* O_APPEND */
-    u32 pos = f->position;
-    if (~pos < n) n = ~pos;                                     /* stay below 4 GB */
-    u32 end = pos + n, had = f->first_cluster;
-    u32 clusters = size / cb + (size % cb != 0);
-    u32 alloc = (clusters <= 0xffffffffu / cb) ? clusters * cb : 0xffffffffu;
+    xfile *xf = xfile_of(c, f);
+    u32 n = (u32)len, cb = xcb(c), had = f->first_cluster;
+    u64 size = xf->size;
+    if (f->oflags & 0x100) xf->pos = size;                      /* O_APPEND */
+    u64 pos = xf->pos, end = pos + n;
+    u64 alloc = (size + cb - 1) / cb * cb;                      /* bytes in the allocated clusters */
     int nofat = f->entry[0x0c] & X_NOFAT, r;
     if (f->first_cluster == 0) {                                /* empty file: first cluster */
         u32 nc;
@@ -728,35 +822,39 @@ int exfat_write(fatms_ctx *c, OpenFile *f, const void *buf, int len)
         alloc = cb;
     } else if (alloc == 0) alloc = cb;
     if (alloc < end) {                                          /* extend from the last cluster */
-        u32 need = (end - alloc) / cb + ((end - alloc) % cb != 0), last, got = 0;
+        u32 need = (u32)((end - alloc + cb - 1) / cb), last, got = 0;
         if (nofat) {                                            /* growing a contiguous file: chain it */
-            if ((r = xchain(c, f->first_cluster, alloc / cb)) < 0) return r;
+            if ((r = xchain(c, f->first_cluster, (u32)(alloc / cb))) < 0) return r;
             f->entry[0x0c] &= (u8)~X_NOFAT;
             nofat = 0;
             f->cur_cluster = f->first_cluster; f->cur_cluster_index = 0; f->ckpt_count = 0;
         }
-        if (fatfs_seek_cluster(c, f, (alloc - 1) / cb, &last) < 0) return FAT_ENOSPC;
+        if (fatfs_seek_cluster(c, f, (u32)((alloc - 1) / cb), &last) < 0) return FAT_ENOSPC;
         r = xextend(c, last, need, &got);
         if (r < 0 && got == 0 && had != 0) { xflush(c); return 0; }   /* card full: nothing written */
-        if (need != got) {                                      /* short allocation: trim the write */
-            n -= (need - got) * cb;
-            if (end % cb) n += cb - end % cb;
+        if (need != got) {                                      /* short allocation: what fits */
+            u64 room = alloc + (u64)got * cb;
+            n = room <= pos ? 0 : room - pos < n ? (u32)(room - pos) : n;
         }
     }
     u32 cl = 0, done = 0;
-    if (!nofat && (r = fatfs_seek_cluster(c, f, pos / cb, &cl)) < 0) {
+    if (xf->valid < pos && (r = xzero(c, f, nofat, xf->valid, pos)) < 0) { xflush(c); return r; }
+    if (xf->valid < pos) xf->valid = pos;
+    if (!nofat && (r = fatfs_seek_cluster(c, f, (u32)(pos / cb), &cl)) < 0) {
         if (had == 0) { xfree(c, f->first_cluster, 0, 0); f->first_cluster = 0; put16(f->entry + 0x1a, 0); put16(f->entry + 0x14, 0); }
         xflush(c);
         return r;
     }
     dirent_stamp(f->entry, 0);
     r = nofat ? xcontig(c, 1, (u8 *)buf, f->first_cluster, pos, n, &done)
-              : fatfs_data_io(c, f, 1, (u8 *)buf, pos, n, cl, &done);
+              : xchained(c, f, 1, (u8 *)buf, pos, n, cl, &done);
     if (r < 0) { xflush(c); return r; }
     pos += done;
-    if (size < pos) F_SIZE(f) = pos;
+    if (xf->size < pos) xf->size = pos;
+    if (xf->valid < pos) xf->valid = pos;
     F_ATTR(f) |= 0x20;                                          /* archive */
-    f->position = pos;
+    xf->pos = pos;
+    xsync(f, xf->size, pos);
     /* exFAT has no DirentCache: allocation (bitmap, FAT) and then the entry reach the card now */
     if ((r = xflush(c)) < 0 || (r = xput(c, f)) < 0) return r;
     return (int)done;
@@ -883,6 +981,7 @@ int exfat_dread(fatms_ctx *c, DirHandle *d, SceIoDirent *de, void *priv)
                         if (slot >= 0 && slot < 16 && h->tab[slot].count-- == 1 && (u32)slot == h->ntab - 1) h->ntab--;
                         return r;
                     }
+                    if (!(ent[0x0b] & 0x10)) de->d_stat.st_size = (SceOff)le64(X.set + 56);   /* past 4 GB too */
                     shown = 1;
                 }
             }
@@ -903,6 +1002,7 @@ int exfat_getstat(fatms_ctx *c, fpath *p, SceIoStat *st)
     u8 ent[32];
     xto_ent(X.set, ent);
     dirent_stat(ent, st);
+    if (!(ent[0x0b] & 0x10)) st->st_size = (SceOff)le64(X.set + 56);                 /* past 4 GB too */
     return 0;
 }
 
@@ -953,7 +1053,7 @@ int exfat_mkdir(fatms_ctx *c, fpath *p)
     dirent_stamp(ent, 1);
     ent[0x0b] = 0x10;
     put16(ent + 0x1a, cl); put16(ent + 0x14, cl >> 16);
-    xbuild(p->leaf, ent, cb);
+    xbuild(p->leaf, ent, cb, cb);
     if ((r = xplace(c, &d, X.set_n, &loc)) < 0 || (r = xset_io(c, &loc, X.set, 1)) < 0) {
         fat_set(&c->fe, cl, 0); xbm_clear(c, cl); xflush(c); return r;
     }
@@ -971,7 +1071,8 @@ int exfat_remove(fatms_ctx *c, fpath *p)
     if (slot_scan(c, p, &idx) & 2) return FAT_EACCES;           /* open files can't be removed */
     if ((r = xlookup(c, &d, p->leaf, &loc)) < 0) return r;
     if (X.set[4] & 0x19) return FAT_EACCES;                     /* read-only or directory */
-    u32 cl = le32(X.set + 52), bytes = le32(X.set + 56);
+    u32 cl = le32(X.set + 52);
+    u64 bytes = le64(X.set + 56);
     int nofat = X.set[33] & X_NOFAT;
     if ((r = xdelete(c, &loc)) >= 0 && (r = xfree(c, cl, nofat, bytes)) >= 0) r = xflush(c);
     return r;
@@ -1005,12 +1106,12 @@ int exfat_move(fatms_ctx *c, fpath *src, fpath *dst)
     if (X.set[4] & 1) return FAT_EACCES;
     u8 ent[32];
     xto_ent(X.set, ent);
-    u32 dirsize = le32(X.set + 56);
+    u64 valid = le64(X.set + 40), size = le64(X.set + 56);     /* kept exactly, past 4 GB too */
     if ((r = xwalk(c, dst->dir, &dd)) < 0) return r;
     r = xlookup(c, &dd, dst->leaf, &dloc);
     if (r == 0) return FAT_EEXIST;
     if (r != FAT_ENOENT) return r;
-    xbuild(dst->leaf, ent, dirsize);
+    xbuild(dst->leaf, ent, valid, size);
     if ((r = xplace(c, &dd, X.set_n, &dloc)) >= 0 && (r = xset_io(c, &dloc, X.set, 1)) >= 0 &&
         (r = xdelete(c, &sloc)) >= 0)
         r = xflush(c);

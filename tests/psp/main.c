@@ -138,6 +138,7 @@ static void es_checks(fst_result *r, u32 es)
     if (!done) fs_print("  (no active ES ISO of 2 KB or more to read)");
     free(a); free(b);
 }
+static int g_large;                                  /* ms0: is exFAT under DratiniFS: files may pass 4 GB */
 static void card_checks(fst_result *r)
 {
     static u8 mbr[512] __attribute__((aligned(64))), s1[512] __attribute__((aligned(64))), s2[512] __attribute__((aligned(64)));
@@ -153,6 +154,7 @@ static void card_checks(fst_result *r)
         if (!e[4] || !len) continue;
         if (e[4] == 0xda) es = lba;
         if (raw(0x04100001, lba, s1, 1) < 0) { check(r, 0, "read a partition's first sector"); continue; }
+        if (i == 0 && !memcmp(s1 + 3, "EXFAT   ", 8)) g_large = FST_LARGE;
         fs_print("  partition %d: type %02x at %u, %u MB%s", i, e[4], (unsigned)lba, (unsigned)(len / 2048),
                  e[4] == 0xda ? " (ES)" : !memcmp(s1 + 3, "EXFAT   ", 8) ? " (exFAT)" : !memcmp(s1 + 82, "FAT32", 5) ? " (FAT32)" : "");
         /* the partition's last sector: read, put back unchanged, read again. Past the adapter's
@@ -164,7 +166,10 @@ static void card_checks(fst_result *r)
         snprintf(what, sizeof what, "last sector of partition %d (%u MB in) readable + writable", i, (unsigned)(last / 2048));
         check(r, ok, what);
     }
-    if (!has_mbr) fs_print("  no MBR (superfloppy card)");
+    if (!has_mbr) {
+        fs_print("  no MBR (superfloppy card)");
+        if (!memcmp(mbr + 3, "EXFAT   ", 8)) g_large = FST_LARGE;
+    }
     struct { u32 init, start, total, count, data, next; } info;
     if (sceIoDevctl("fatms0:", 0x04100003, 0, 0, &info, sizeof info) >= 0 && info.init) es_checks(r, info.start);
     else if (es) check(r, 0, "ES partition in the MBR but not loaded");
@@ -198,12 +203,12 @@ int main(void)
     sceKernelSetCompiledSdkVersion660(0x06060110);
     if ((u32)sceKernelGetCompiledSdkVersion() != 0x06060110) fs_print("  (can't select SDK 6.60: running pass 1 in the current mode)");
     fs_print("== pass 1: SDK 0x%08x", (unsigned)sceKernelGetCompiledSdkVersion());
-    fst_run("ms0:/FATMSTEST", FST_BIG | FST_KEEP, &r);
+    fst_run("ms0:/FATMSTEST", FST_BIG | FST_KEEP | g_large, &r);
 
     sceKernelSetCompiledSdkVersion370(0x03070110);
     if ((u32)sceKernelGetCompiledSdkVersion() == 0x03070110) {
         fs_print("== pass 2: SDK 0x%08x", (unsigned)sceKernelGetCompiledSdkVersion());
-        fst_run("ms0:/FATMSTEST", FST_NAMES_ONLY, &r);
+        fst_run("ms0:/FATMSTEST", FST_NAMES_ONLY | g_large, &r);
     } else {
         r.skip++;
         fs_print("  SKIP pass 2: can't select SDK 3.70 (Shift-JIS names untested)");

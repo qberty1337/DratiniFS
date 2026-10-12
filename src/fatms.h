@@ -290,6 +290,8 @@ int  exfat_rmdir(fatms_ctx *c, fpath *p);
 int  exfat_move(fatms_ctx *c, fpath *src, fpath *dst);
 int  exfat_sync_free(fatms_ctx *c);                  /* devinfo: the bitmap's free count */
 int  exfat_root_free(fatms_ctx *c, u32 *out);
+int  exfat_lseek(fatms_ctx *c, OpenFile *f, SceOff ofs, int whence, SceOff *out);   /* 64-bit positions */
+int  exfat_at_eof(fatms_ctx *c, OpenFile *f);
 int  dread_emit(fatms_ctx *c, SceIoDirent *de, void *priv, const u8 *ent, const u16 *leaf, const char *sfn);
 int  flagcheck(unsigned flags, int exists);          /* fatfs_ops.c FUN_00008514 (shared with exFAT) */
 u32  slot_scan(fatms_ctx *c, const fpath *p, int *idx); /* FUN_0000a200 */
